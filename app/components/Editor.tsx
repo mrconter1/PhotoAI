@@ -14,6 +14,7 @@ import {
 import CropOverlay from "./CropOverlay";
 
 type Tool = "move" | "crop" | "ai";
+type PanelTab = "settings" | "transform" | "ai" | "info";
 type Viewport = { zoom: number; x: number; y: number };
 
 const FULL_CROP: CropRect = { x: 0, y: 0, w: 1, h: 1 };
@@ -28,6 +29,8 @@ export default function Editor() {
   const [adjust, setAdjust] = useState<Adjustments>(NEUTRAL_ADJUSTMENTS);
   const [tool, setTool] = useState<Tool>("move");
   const [crop, setCrop] = useState<CropRect>(FULL_CROP);
+  const [cropAspect, setCropAspect] = useState<number | null>(null); // pixel w/h; null = free
+  const [panelTab, setPanelTab] = useState<PanelTab>("settings");
 
   const [aiPrompt, setAiPrompt] = useState("");
   const [aiBusy, setAiBusy] = useState(false);
@@ -212,6 +215,25 @@ export default function Editor() {
     setTool("move");
   }, [img, adjust, crop, pushState]);
 
+  // Locked crop ratio expressed in normalized (w/h) units for the overlay.
+  const cropNormRatio = cropAspect && img ? cropAspect * (img.naturalHeight / img.naturalWidth) : null;
+  const chooseCropAspect = useCallback(
+    (px: number | null) => {
+      setCropAspect(px);
+      if (px && img) {
+        const nr = px * (img.naturalHeight / img.naturalWidth);
+        setCrop((c) => {
+          const cx = c.x + c.w / 2;
+          const cy = c.y + c.h / 2;
+          const w = c.w;
+          const h = w / nr;
+          return { x: cx - w / 2, y: cy - h / 2, w, h };
+        });
+      }
+    },
+    [img]
+  );
+
   const runAI = useCallback(async () => {
     if (!img || !aiPrompt.trim()) return;
     setError(null);
@@ -299,10 +321,18 @@ export default function Editor() {
     return () => el.removeEventListener("wheel", onWheel);
   }, [zoomAt, current]);
 
+  // keep latest tool/applyCrop for the (stable) key handler
+  const toolRef = useRef(tool);
+  toolRef.current = tool;
+  const applyCropRef = useRef(applyCrop);
+  applyCropRef.current = applyCrop;
+  const downloadRef = useRef(doDownload);
+  downloadRef.current = doDownload;
+
   // space-to-pan + shortcuts
   useEffect(() => {
     const isTyping = (t: EventTarget | null) =>
-      t instanceof HTMLElement && (t.tagName === "INPUT" || t.tagName === "TEXTAREA");
+      t instanceof HTMLElement && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.tagName === "SELECT");
     const down = (e: KeyboardEvent) => {
       if (e.code === "Space" && !isTyping(e.target)) {
         e.preventDefault();
@@ -313,6 +343,18 @@ export default function Editor() {
       } else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "y") {
         e.preventDefault();
         stepForward();
+      } else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "s") {
+        e.preventDefault();
+        void downloadRef.current(); // save full-res PNG
+      } else if (!e.ctrlKey && !e.metaKey && !e.altKey && !isTyping(e.target)) {
+        // single-key tool / panel shortcuts
+        const k = e.key.toLowerCase();
+        if (k === "c") setTool("crop");
+        else if (k === "a") setTool("ai");
+        else if (k === "v") setTool("move");
+        else if (k === "i") setPanelTab("settings");
+        else if (k === "t") setPanelTab("transform");
+        else if (e.key === "Enter" && toolRef.current === "crop") applyCropRef.current();
       }
     };
     const up = (e: KeyboardEvent) => e.code === "Space" && setSpaceDown(false);
@@ -404,7 +446,7 @@ export default function Editor() {
                   boxShadow: "0 0 0 1px rgba(255,255,255,0.08), 0 12px 40px rgba(0,0,0,0.5)",
                 }}
               />
-              {tool === "crop" && <CropOverlay imgBox={imgBox} value={crop} onChange={setCrop} />}
+              {tool === "crop" && <CropOverlay imgBox={imgBox} value={crop} onChange={setCrop} ratio={cropNormRatio} />}
             </>
           )}
 
@@ -458,9 +500,29 @@ export default function Editor() {
 
         {tool === "crop" && (
           <Section title="Crop">
-            <p style={hint}>Drag the handles - pull them past the photo edge to crop out (extend the canvas).</p>
+            <span style={label}>Aspect ratio</span>
+            <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
+              {([["Free", null], ["1:1", 1], ["16:9", 16 / 9], ["9:16", 9 / 16], ["4:3", 4 / 3], ["3:4", 3 / 4], ["3:2", 3 / 2], ["2:3", 2 / 3]] as [string, number | null][]).map(
+                ([lbl, r]) => (
+                  <button
+                    key={lbl}
+                    onClick={() => chooseCropAspect(r)}
+                    style={{
+                      fontSize: 11,
+                      padding: "5px 9px",
+                      background: cropAspect === r || (r === null && cropAspect === null) ? "var(--accent)" : undefined,
+                      borderColor: cropAspect === r || (r === null && cropAspect === null) ? "var(--accent)" : undefined,
+                      color: cropAspect === r || (r === null && cropAspect === null) ? "#fff" : undefined,
+                    }}
+                  >
+                    {lbl}
+                  </button>
+                )
+              )}
+            </div>
+            <p style={hint}>Drag the handles - pull them past the photo edge to crop out. Press Enter to apply.</p>
             <div style={{ display: "flex", gap: 8 }}>
-              <button style={{ flex: 1 }} onClick={() => setCrop(FULL_CROP)}>Reset</button>
+              <button style={{ flex: 1 }} onClick={() => { setCrop(FULL_CROP); chooseCropAspect(null); }}>Reset</button>
               <button className="primary" style={{ flex: 1 }} onClick={applyCrop}>Apply crop</button>
             </div>
           </Section>
@@ -483,6 +545,8 @@ export default function Editor() {
           setAiAspect={setAiAspect}
           aiSize={aiSize}
           setAiSize={setAiSize}
+          tab={panelTab}
+          setTab={setPanelTab}
         />
       </aside>
     </div>
@@ -562,7 +626,7 @@ function TopBar(props: {
       <button title="Toggle last change (Ctrl+Z)" onClick={props.onToggle} disabled={!props.canBack}>Toggle</button>
       <button title="Step back (Ctrl+Shift+Z)" onClick={props.onBack} disabled={!props.canBack}>◀ Back</button>
       <button title="Step forward (Ctrl+Y)" onClick={props.onForward} disabled={!props.canForward}>Fwd ▶</button>
-      <button className="primary" onClick={props.onDownload}>Download</button>
+      <button className="primary" title="Save full-res PNG (Ctrl+S)" onClick={props.onDownload}>Download</button>
     </header>
   );
 }
@@ -575,8 +639,6 @@ function Section({ title, children }: { title: string; children: React.ReactNode
     </div>
   );
 }
-
-type PanelTab = "settings" | "transform" | "ai" | "info";
 
 function RightPanel(props: {
   adjust: Adjustments;
@@ -594,9 +656,12 @@ function RightPanel(props: {
   setAiAspect: (v: string) => void;
   aiSize: string;
   setAiSize: (v: string) => void;
+  tab: PanelTab;
+  setTab: (t: PanelTab) => void;
 }) {
   const { adjust, setAdjust, img } = props;
-  const [pt, setPt] = useState<PanelTab>("settings");
+  const pt = props.tab;
+  const setPt = props.setTab;
   const tabs: [PanelTab, string][] = [
     ["settings", "Image"],
     ["transform", "Transform"],

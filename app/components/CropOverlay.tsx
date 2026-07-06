@@ -8,13 +8,14 @@ type Props = {
   imgBox: { left: number; top: number; width: number; height: number };
   value: CropRect;
   onChange: (r: CropRect) => void;
+  ratio?: number | null; // locked w/h in normalized units; null/undefined = free
 };
 
 type Handle = "move" | "nw" | "ne" | "sw" | "se" | "n" | "s" | "e" | "w";
 
 const MIN = 0.03;
 
-export default function CropOverlay({ imgBox, value, onChange }: Props) {
+export default function CropOverlay({ imgBox, value, onChange, ratio }: Props) {
   // Drag handling via window listeners so the pointer can leave the image
   // (crop-out) and the empty stage keeps receiving pan/zoom events.
   const startDrag = useCallback(
@@ -40,6 +41,26 @@ export default function CropOverlay({ imgBox, value, onChange }: Props) {
           if (handle.includes("e")) x2 = Math.max(x2 + dx, x + MIN);
           if (handle.includes("n")) y = Math.min(y + dy, y2 - MIN);
           if (handle.includes("s")) y2 = Math.max(y2 + dy, y + MIN);
+
+          if (ratio) {
+            // keep locked aspect ratio while resizing
+            const cxm = start.x + start.w / 2;
+            const cym = start.y + start.h / 2;
+            if (handle === "n" || handle === "s") {
+              const nw = (y2 - y) * ratio;
+              x = cxm - nw / 2;
+              x2 = cxm + nw / 2;
+            } else if (handle === "e" || handle === "w") {
+              const nh = (x2 - x) / ratio;
+              y = cym - nh / 2;
+              y2 = cym + nh / 2;
+            } else {
+              // corner: derive height from width, anchored at the fixed corner
+              const nh = (x2 - x) / ratio;
+              if (handle.includes("n")) y = y2 - nh;
+              else y2 = y + nh;
+            }
+          }
           w = x2 - x;
           h = y2 - y;
         }
