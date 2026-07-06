@@ -33,6 +33,31 @@ export default function Editor() {
   const [aiBusy, setAiBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
+  // AI settings
+  const [models, setModels] = useState<string[]>([]);
+  const [aiModel, setAiModel] = useState("");
+  const [aiAspect, setAiAspect] = useState(""); // "" = match input
+  const [aiSize, setAiSize] = useState(""); // "" = model default
+  const aiInputRef = useRef<HTMLTextAreaElement>(null);
+
+  // load available image models once
+  useEffect(() => {
+    fetch("/api/models")
+      .then((r) => r.json())
+      .then((d) => {
+        if (Array.isArray(d.models)) {
+          setModels(d.models);
+          setAiModel((m) => m || d.default || d.models[0] || "");
+        }
+      })
+      .catch(() => {});
+  }, []);
+
+  // auto-focus the prompt when the AI tool is chosen
+  useEffect(() => {
+    if (tool === "ai") aiInputRef.current?.focus();
+  }, [tool]);
+
   const stageRef = useRef<HTMLDivElement>(null);
   const [stageSize, setStageSize] = useState({ w: 0, h: 0 });
   const [view, setView] = useState<Viewport>({ zoom: 1, x: 0, y: 0 });
@@ -71,15 +96,15 @@ export default function Editor() {
     [img, stageSize]
   );
 
-  // fit whenever a new image loads or the stage first gets a size
-  const fitKey = `${img?.src ?? ""}|${stageSize.w}x${stageSize.h}`;
-  const lastFit = useRef("");
+  // Fit to screen only when a new file is opened — NOT on history navigation
+  // (undo/redo/toggle keep the current zoom + pan so you stay in the same spot).
+  const pendingFit = useRef(true);
   useEffect(() => {
-    if (img && stageSize.w && lastFit.current !== fitKey) {
-      lastFit.current = fitKey;
+    if (img && stageSize.w && pendingFit.current) {
+      pendingFit.current = false;
       fitToScreen(img, stageSize);
     }
-  }, [img, stageSize, fitKey, fitToScreen]);
+  }, [img, stageSize, fitToScreen]);
 
   // ---- history --------------------------------------------------------------
   const pushState = useCallback(
@@ -96,6 +121,7 @@ export default function Editor() {
     try {
       const url = await fileToDataUrl(file);
       const el = await loadImage(url);
+      pendingFit.current = true; // fit the newly opened image
       setHistory([url]);
       setIndex(0);
       setImg(el);
@@ -140,18 +166,24 @@ export default function Editor() {
       const res = await fetch("/api/ai-edit", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ image: flat.src, prompt: aiPrompt.trim() }),
+        body: JSON.stringify({
+          image: flat.src,
+          prompt: aiPrompt.trim(),
+          model: aiModel || undefined,
+          aspectRatio: aiAspect || undefined,
+          imageSize: aiSize || undefined,
+        }),
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || "AI request failed.");
       pushState(data.image);
-      setTool("move");
+      setAiPrompt(""); // clear on success; stay on the AI tool for the next edit
     } catch (e) {
       setError(e instanceof Error ? e.message : "AI request failed.");
     } finally {
       setAiBusy(false);
     }
-  }, [img, aiPrompt, flatten, pushState]);
+  }, [img, aiPrompt, aiModel, aiAspect, aiSize, flatten, pushState]);
 
   const doDownload = useCallback(async () => {
     const flat = await flatten();
@@ -272,8 +304,6 @@ export default function Editor() {
         setTool={setTool}
         onZoomIn={() => zoomButton(1.25)}
         onZoomOut={() => zoomButton(1 / 1.25)}
-        onFit={() => fitToScreen()}
-        zoom={view.zoom}
       />
 
       {/* CENTER STAGE */}
@@ -322,6 +352,45 @@ export default function Editor() {
 
           {/* floating zoom badge */}
           <div style={zoomBadge}>{Math.round(view.zoom * 100)}%</div>
+
+          {/* floating AI prompt bar, below the image */}
+          {tool === "ai" && (
+            <div style={aiBar}>
+              {aiBusy && (
+                <div style={aiBusyOverlay}>
+                  <span className="spinner" />
+                  <span style={{ fontSize: 12 }}>Generating with {aiModel || "model"}…</span>
+                </div>
+              )}
+              <div style={{ display: "flex", gap: 8, alignItems: "flex-end" }}>
+                <textarea
+                  ref={aiInputRef}
+                  rows={1}
+                  placeholder="Describe an edit — e.g. remove the background, make it golden-hour…"
+                  value={aiPrompt}
+                  onChange={(e) => setAiPrompt(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter" && !e.shiftKey) {
+                      e.preventDefault();
+                      void runAI();
+                    }
+                  }}
+                  style={{ flex: 1, minHeight: 40, maxHeight: 120, background: "var(--panel-2)" }}
+                  disabled={aiBusy}
+                />
+                <button className="primary" onClick={runAI} disabled={aiBusy || !aiPrompt.trim()} style={{ height: 40 }}>
+                  {aiBusy ? "…" : "Generate"}
+                </button>
+              </div>
+              <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginTop: 8 }}>
+                {["Remove background", "Black & white film", "Enhance & sharpen", "Golden-hour light"].map((p) => (
+                  <button key={p} style={{ fontSize: 11, padding: "4px 8px" }} onClick={() => setAiPrompt(p)} disabled={aiBusy}>
+                    {p}
+                  </button>
+                ))}
+              </div>
+            </div>
+          )}
         </div>
       </div>
 
@@ -339,19 +408,6 @@ export default function Editor() {
           </Section>
         )}
 
-        {tool === "ai" && (
-          <Section title="AI Edit">
-            <p style={hint}>Describe a change. Your photo is sent to Google&apos;s image model and returned as a new step.</p>
-            <textarea rows={5} placeholder="e.g. Remove the background and make it a clean white studio shot" value={aiPrompt} onChange={(e) => setAiPrompt(e.target.value)} />
-            <button className="primary" onClick={runAI} disabled={aiBusy || !aiPrompt.trim()}>{aiBusy ? "Generating…" : "Run AI edit"}</button>
-            <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
-              {["Remove background", "Black & white film", "Enhance & sharpen", "Golden-hour light"].map((p) => (
-                <button key={p} style={{ fontSize: 11, padding: "5px 8px" }} onClick={() => setAiPrompt(p)}>{p}</button>
-              ))}
-            </div>
-          </Section>
-        )}
-
         {/* Tabbed settings — always available */}
         <RightPanel
           adjust={adjust}
@@ -362,6 +418,13 @@ export default function Editor() {
           zoom={view.zoom}
           step={index}
           total={history.length}
+          models={models}
+          aiModel={aiModel}
+          setAiModel={setAiModel}
+          aiAspect={aiAspect}
+          setAiAspect={setAiAspect}
+          aiSize={aiSize}
+          setAiSize={setAiSize}
         />
       </aside>
     </div>
@@ -375,8 +438,6 @@ function ToolRail(props: {
   setTool: (t: Tool) => void;
   onZoomIn: () => void;
   onZoomOut: () => void;
-  onFit: () => void;
-  zoom: number;
 }) {
   const tools: [Tool, string, string][] = [
     ["move", "🖐", "Move / Pan  (V, or hold Space)"],
@@ -393,7 +454,6 @@ function ToolRail(props: {
       <div style={{ flex: 1 }} />
       <RailButton title="Zoom in  (scroll up)" onClick={props.onZoomIn}>＋</RailButton>
       <RailButton title="Zoom out  (scroll down)" onClick={props.onZoomOut}>－</RailButton>
-      <RailButton title="Fit to screen" onClick={props.onFit}>⤢</RailButton>
     </div>
   );
 }
@@ -458,7 +518,7 @@ function Section({ title, children }: { title: string; children: React.ReactNode
   );
 }
 
-type PanelTab = "settings" | "transform" | "info";
+type PanelTab = "settings" | "transform" | "ai" | "info";
 
 function RightPanel(props: {
   adjust: Adjustments;
@@ -469,12 +529,20 @@ function RightPanel(props: {
   zoom: number;
   step: number;
   total: number;
+  models: string[];
+  aiModel: string;
+  setAiModel: (v: string) => void;
+  aiAspect: string;
+  setAiAspect: (v: string) => void;
+  aiSize: string;
+  setAiSize: (v: string) => void;
 }) {
   const { adjust, setAdjust, img } = props;
   const [pt, setPt] = useState<PanelTab>("settings");
   const tabs: [PanelTab, string][] = [
-    ["settings", "Image Settings"],
+    ["settings", "Image"],
     ["transform", "Transform"],
+    ["ai", "AI Settings"],
     ["info", "Information"],
   ];
   const sliders: [keyof Adjustments, string, number, number][] = [
@@ -565,6 +633,46 @@ function RightPanel(props: {
         </div>
       )}
 
+      {pt === "ai" && (
+        <div style={{ padding: 16, display: "grid", gap: 14 }}>
+          <div style={{ display: "grid", gap: 4 }}>
+            <span style={label}>Model</span>
+            <select
+              value={props.aiModel}
+              onChange={(e) => props.setAiModel(e.target.value)}
+              style={selectStyle}
+            >
+              {props.models.length === 0 && <option value="">Loading…</option>}
+              {props.models.map((m) => (
+                <option key={m} value={m}>{m}</option>
+              ))}
+            </select>
+            <span style={{ ...hint, marginTop: 2 }}>Fetched from your Google account&apos;s available image models.</span>
+          </div>
+
+          <div style={{ display: "grid", gap: 4 }}>
+            <span style={label}>Aspect ratio</span>
+            <select value={props.aiAspect} onChange={(e) => props.setAiAspect(e.target.value)} style={selectStyle}>
+              <option value="">Match input</option>
+              {["1:1", "3:2", "2:3", "4:3", "3:4", "16:9", "9:16", "21:9"].map((r) => (
+                <option key={r} value={r}>{r}</option>
+              ))}
+            </select>
+          </div>
+
+          <div style={{ display: "grid", gap: 4 }}>
+            <span style={label}>Resolution</span>
+            <select value={props.aiSize} onChange={(e) => props.setAiSize(e.target.value)} style={selectStyle}>
+              <option value="">Model default</option>
+              {["1K", "2K", "4K"].map((s) => (
+                <option key={s} value={s}>{s}</option>
+              ))}
+            </select>
+            <span style={{ ...hint, marginTop: 2 }}>Aspect ratio &amp; resolution apply where the selected model supports them.</span>
+          </div>
+        </div>
+      )}
+
       {pt === "info" && (
         <div style={{ padding: 16, display: "grid", gap: 8 }}>
           {info.map(([k, v]) => (
@@ -606,6 +714,35 @@ function Dropzone({ onFile, error }: { onFile: (f: File) => void; error: string 
 /* =========================== styles =========================== */
 const label: React.CSSProperties = { fontSize: 12, fontWeight: 600 };
 const hint: React.CSSProperties = { fontSize: 12, color: "var(--muted)", margin: 0, lineHeight: 1.5 };
+const selectStyle: React.CSSProperties = {
+  background: "var(--bg)",
+  color: "var(--text)",
+  border: "1px solid var(--border)",
+  borderRadius: 8,
+  padding: "9px 10px",
+  fontSize: 13,
+  width: "100%",
+};
+const aiBar: React.CSSProperties = {
+  position: "absolute",
+  left: "50%",
+  bottom: 18,
+  transform: "translateX(-50%)",
+  width: "min(680px, calc(100% - 32px))",
+  background: "rgba(23,23,28,0.92)",
+  backdropFilter: "blur(8px)",
+  border: "1px solid var(--border)",
+  borderRadius: 12,
+  padding: 12,
+  boxShadow: "0 12px 40px rgba(0,0,0,0.55)",
+};
+const aiBusyOverlay: React.CSSProperties = {
+  display: "flex",
+  alignItems: "center",
+  gap: 10,
+  color: "var(--muted)",
+  marginBottom: 10,
+};
 const zoomBadge: React.CSSProperties = {
   position: "absolute",
   left: 12,

@@ -5,12 +5,15 @@ import { GoogleGenAI } from "@google/genai";
 export const runtime = "nodejs";
 export const maxDuration = 60;
 
-const MODEL = process.env.GOOGLE_IMAGE_MODEL || "gemini-3-pro-image";
+const DEFAULT_MODEL = process.env.GOOGLE_IMAGE_MODEL || "gemini-3-pro-image";
 
 type Body = {
   // data URL: "data:image/png;base64,...."
   image: string;
   prompt: string;
+  model?: string;
+  aspectRatio?: string; // "" = match input, or e.g. "16:9"
+  imageSize?: string; // "" = default, or "1K" | "2K" | "4K"
 };
 
 function parseDataUrl(dataUrl: string): { mimeType: string; data: string } | null {
@@ -35,7 +38,7 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ error: "Invalid JSON body." }, { status: 400 });
   }
 
-  const { image, prompt } = body;
+  const { image, prompt, model, aspectRatio, imageSize } = body;
   if (!image || !prompt?.trim()) {
     return NextResponse.json({ error: "Both 'image' and 'prompt' are required." }, { status: 400 });
   }
@@ -45,11 +48,18 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ error: "Image must be a base64 data URL." }, { status: 400 });
   }
 
+  // Optional image config (aspect ratio / resolution) — only sent when set.
+  const imageConfig: Record<string, string> = {};
+  if (aspectRatio) imageConfig.aspectRatio = aspectRatio;
+  if (imageSize) imageConfig.imageSize = imageSize;
+  const config =
+    Object.keys(imageConfig).length > 0 ? { imageConfig } : undefined;
+
   try {
     const ai = new GoogleGenAI({ apiKey });
 
     const response = await ai.models.generateContent({
-      model: MODEL,
+      model: model || DEFAULT_MODEL,
       contents: [
         {
           role: "user",
@@ -59,6 +69,7 @@ export async function POST(req: NextRequest) {
           ],
         },
       ],
+      ...(config ? { config } : {}),
     });
 
     // Find the first returned image part.
