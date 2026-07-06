@@ -100,12 +100,15 @@ export default function Editor() {
       const m = matchView.current;
       matchView.current = null;
       if (m) {
-        const oldAspect = m.natW / m.natH;
-        const newAspect = el.naturalWidth / el.naturalHeight;
-        // same aspect ratio → keep the identical on-screen rectangle
-        if (Math.abs(oldAspect - newAspect) < 0.01) {
-          setView({ zoom: (m.natW * m.zoom) / el.naturalWidth, x: m.x, y: m.y });
-        }
+        // Keep the result in roughly the same place: fit it inside the previous
+        // on-screen box and center it on the same point. Same aspect ratio →
+        // lands on the exact same rectangle; different aspect → best-fit overlap.
+        const boxW = m.natW * m.zoom;
+        const boxH = m.natH * m.zoom;
+        const cx = m.x + boxW / 2;
+        const cy = m.y + boxH / 2;
+        const zoom = Math.min(boxW / el.naturalWidth, boxH / el.naturalHeight);
+        setView({ zoom, x: cx - (el.naturalWidth * zoom) / 2, y: cy - (el.naturalHeight * zoom) / 2 });
       }
     });
     return () => {
