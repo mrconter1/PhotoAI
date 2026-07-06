@@ -88,8 +88,10 @@ export default function Editor() {
   const [panning, setPanning] = useState(false);
 
   // ---- image + stage sizing -------------------------------------------------
-  // when set, place the next-loaded image to match a remembered on-screen box
-  const matchView = useRef<{ natW: number; natH: number; zoom: number; x: number; y: number } | null>(null);
+  // The on-screen framing to preserve across history/AI swaps (stage px).
+  // Updated only by user zoom/pan and file open — NOT by image swaps — so
+  // toggling between different-resolution versions keeps a constant size.
+  const frame = useRef<{ cx: number; cy: number; w: number; h: number } | null>(null);
 
   useEffect(() => {
     if (!current) return;
@@ -97,24 +99,35 @@ export default function Editor() {
     loadImage(current).then((el) => {
       if (cancelled) return;
       setImg(el);
-      const m = matchView.current;
-      matchView.current = null;
-      if (m) {
-        // Keep the result in roughly the same place: fit it inside the previous
-        // on-screen box and center it on the same point. Same aspect ratio →
-        // lands on the exact same rectangle; different aspect → best-fit overlap.
-        const boxW = m.natW * m.zoom;
-        const boxH = m.natH * m.zoom;
-        const cx = m.x + boxW / 2;
-        const cy = m.y + boxH / 2;
-        const zoom = Math.min(boxW / el.naturalWidth, boxH / el.naturalHeight);
-        setView({ zoom, x: cx - (el.naturalWidth * zoom) / 2, y: cy - (el.naturalHeight * zoom) / 2 });
-      }
+      if (pendingFit.current) return; // a fresh open fits itself (see below)
+      const f = frame.current;
+      if (!f) return;
+      // fit the new image into the remembered frame, centered on the same point
+      const zoom = Math.min(f.w / el.naturalWidth, f.h / el.naturalHeight);
+      fromSwap.current = true; // this view change must NOT move the frame
+      setView({ zoom, x: f.cx - (el.naturalWidth * zoom) / 2, y: f.cy - (el.naturalHeight * zoom) / 2 });
     });
     return () => {
       cancelled = true;
     };
   }, [current]);
+
+  // Remember the current framing whenever the user zooms/pans or fits/opens,
+  // but ignore view changes that came from an image swap (guarded above).
+  const fromSwap = useRef(false);
+  useEffect(() => {
+    if (!img) return;
+    if (fromSwap.current) {
+      fromSwap.current = false;
+      return;
+    }
+    frame.current = {
+      cx: view.x + (img.naturalWidth * view.zoom) / 2,
+      cy: view.y + (img.naturalHeight * view.zoom) / 2,
+      w: img.naturalWidth * view.zoom,
+      h: img.naturalHeight * view.zoom,
+    };
+  }, [view, img]);
 
   useEffect(() => {
     const el = stageRef.current;
@@ -218,10 +231,6 @@ export default function Editor() {
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || "AI request failed.");
-      // Remember the on-screen placement so an AI result with the SAME aspect
-      // ratio (e.g. a resolution bump) lands in the exact same spot — makes
-      // before/after comparison via undo trivial.
-      matchView.current = { natW: flat.naturalWidth, natH: flat.naturalHeight, zoom: view.zoom, x: view.x, y: view.y };
       pushState(data.image);
       setAiPrompt(""); // clear on success; stay on the AI tool for the next edit
     } catch (e) {
@@ -229,7 +238,7 @@ export default function Editor() {
     } finally {
       setAiBusy(false);
     }
-  }, [img, aiPrompt, aiModel, aiAspect, aiSize, view, flatten, pushState]);
+  }, [img, aiPrompt, aiModel, aiAspect, aiSize, flatten, pushState]);
 
   const doDownload = useCallback(async () => {
     const flat = await flatten();
