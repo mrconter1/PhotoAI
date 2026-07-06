@@ -5,7 +5,7 @@ import { GoogleGenAI } from "@google/genai";
 export const runtime = "nodejs";
 export const maxDuration = 60;
 
-const DEFAULT_MODEL = process.env.GOOGLE_IMAGE_MODEL || "gemini-3-pro-image";
+const DEFAULT_MODEL = process.env.GOOGLE_IMAGE_MODEL || "gemini-3.1-flash-image";
 
 type Body = {
   // data URL: "data:image/png;base64,...."

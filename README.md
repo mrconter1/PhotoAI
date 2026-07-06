@@ -32,7 +32,8 @@ npm run dev
 ```
 
 Get an API key at https://aistudio.google.com/apikey.
-The default model is `gemini-3-pro-image` (override with `GOOGLE_IMAGE_MODEL`).
+The default model is `gemini-3.1-flash-image` (override with `GOOGLE_IMAGE_MODEL`,
+or pick any available model in the app's AI Settings tab).
 
 ## Notes
 

@@ -88,10 +88,26 @@ export default function Editor() {
   const [panning, setPanning] = useState(false);
 
   // ---- image + stage sizing -------------------------------------------------
+  // when set, place the next-loaded image to match a remembered on-screen box
+  const matchView = useRef<{ natW: number; natH: number; zoom: number; x: number; y: number } | null>(null);
+
   useEffect(() => {
     if (!current) return;
     let cancelled = false;
-    loadImage(current).then((el) => !cancelled && setImg(el));
+    loadImage(current).then((el) => {
+      if (cancelled) return;
+      setImg(el);
+      const m = matchView.current;
+      matchView.current = null;
+      if (m) {
+        const oldAspect = m.natW / m.natH;
+        const newAspect = el.naturalWidth / el.naturalHeight;
+        // same aspect ratio → keep the identical on-screen rectangle
+        if (Math.abs(oldAspect - newAspect) < 0.01) {
+          setView({ zoom: (m.natW * m.zoom) / el.naturalWidth, x: m.x, y: m.y });
+        }
+      }
+    });
     return () => {
       cancelled = true;
     };
@@ -199,6 +215,10 @@ export default function Editor() {
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || "AI request failed.");
+      // Remember the on-screen placement so an AI result with the SAME aspect
+      // ratio (e.g. a resolution bump) lands in the exact same spot — makes
+      // before/after comparison via undo trivial.
+      matchView.current = { natW: flat.naturalWidth, natH: flat.naturalHeight, zoom: view.zoom, x: view.x, y: view.y };
       pushState(data.image);
       setAiPrompt(""); // clear on success; stay on the AI tool for the next edit
     } catch (e) {
@@ -206,7 +226,7 @@ export default function Editor() {
     } finally {
       setAiBusy(false);
     }
-  }, [img, aiPrompt, aiModel, aiAspect, aiSize, flatten, pushState]);
+  }, [img, aiPrompt, aiModel, aiAspect, aiSize, view, flatten, pushState]);
 
   const doDownload = useCallback(async () => {
     const flat = await flatten();

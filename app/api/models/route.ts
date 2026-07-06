@@ -29,7 +29,7 @@ export async function GET() {
       .map((m: Model) => m.name.replace(/^models\//, ""));
 
     // Ensure the configured default is present even if filtering missed it.
-    const preferred = process.env.GOOGLE_IMAGE_MODEL || "gemini-3-pro-image";
+    const preferred = process.env.GOOGLE_IMAGE_MODEL || "gemini-3.1-flash-image";
     if (!models.includes(preferred)) models.unshift(preferred);
 
     return NextResponse.json({ models, default: preferred });
