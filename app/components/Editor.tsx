@@ -13,11 +13,22 @@ import {
 } from "@/lib/image";
 import CropOverlay from "./CropOverlay";
 
-type Tool = "move" | "crop" | "ai";
+// "none" = plain pan/move mode (always available); crop/ai are the active tools
+type Tool = "none" | "crop" | "ai";
 type PanelTab = "settings" | "transform" | "ai" | "info";
 type Viewport = { zoom: number; x: number; y: number };
 
 const FULL_CROP: CropRect = { x: 0, y: 0, w: 1, h: 1 };
+const CROP_RATIOS: [string, number | null][] = [
+  ["Free", null],
+  ["1:1", 1],
+  ["16:9", 16 / 9],
+  ["9:16", 9 / 16],
+  ["4:3", 4 / 3],
+  ["3:4", 3 / 4],
+  ["3:2", 3 / 2],
+  ["2:3", 2 / 3],
+];
 
 export default function Editor() {
   // full, uncapped history of baked PNG data URLs; index = current state
@@ -27,7 +38,7 @@ export default function Editor() {
 
   const [img, setImg] = useState<HTMLImageElement | null>(null);
   const [adjust, setAdjust] = useState<Adjustments>(NEUTRAL_ADJUSTMENTS);
-  const [tool, setTool] = useState<Tool>("move");
+  const [tool, setTool] = useState<Tool>("none");
   const [crop, setCrop] = useState<CropRect>(FULL_CROP);
   const [cropAspect, setCropAspect] = useState<number | null>(null); // pixel w/h; null = free
   const [panelTab, setPanelTab] = useState<PanelTab>("settings");
@@ -35,6 +46,9 @@ export default function Editor() {
   const [aiPrompt, setAiPrompt] = useState("");
   const [aiBusy, setAiBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [savedUrl, setSavedUrl] = useState<string | null>(null); // last opened/saved image
+  const [confirmOpen, setConfirmOpen] = useState(false); // unsaved-changes dialog
+  const openInputRef = useRef<HTMLInputElement>(null);
 
   // AI settings
   const [models, setModels] = useState<string[]>([]);
@@ -87,7 +101,6 @@ export default function Editor() {
   const stageRef = useRef<HTMLDivElement>(null);
   const [stageSize, setStageSize] = useState({ w: 0, h: 0 });
   const [view, setView] = useState<Viewport>({ zoom: 1, x: 0, y: 0 });
-  const [spaceDown, setSpaceDown] = useState(false);
   const [panning, setPanning] = useState(false);
 
   // ---- image + stage sizing -------------------------------------------------
@@ -184,7 +197,8 @@ export default function Editor() {
       setIndex(0);
       setImg(el);
       setAdjust(NEUTRAL_ADJUSTMENTS);
-      setTool("move");
+      setSavedUrl(url); // freshly opened = clean
+      setTool("none");
     } catch (e) {
       setError(e instanceof Error ? e.message : "Could not open image.");
     }
@@ -212,7 +226,7 @@ export default function Editor() {
     if (!img) return;
     pushState(bake(img, { rotate: 0, flipH: false, flipV: false }, adjust, crop));
     setCrop(FULL_CROP);
-    setTool("move");
+    setTool("none");
   }, [img, adjust, crop, pushState]);
 
   // Locked crop ratio expressed in normalized (w/h) units for the overlay.
@@ -265,7 +279,21 @@ export default function Editor() {
   const doDownload = useCallback(async () => {
     const flat = await flatten();
     download(flat.src, "photoai-export.png");
+    setSavedUrl(flat.src); // saving marks the current image clean
   }, [flatten]);
+
+  // Unsaved changes = current differs from the last opened/saved image,
+  // or there are uncommitted live adjustments.
+  const dirty =
+    current !== null &&
+    (current !== savedUrl ||
+      adjustmentsToFilter(adjust) !== adjustmentsToFilter(NEUTRAL_ADJUSTMENTS));
+
+  const triggerPicker = useCallback(() => openInputRef.current?.click(), []);
+  const requestOpen = useCallback(() => {
+    if (dirty) setConfirmOpen(true);
+    else triggerPicker();
+  }, [dirty, triggerPicker]);
 
   // Ctrl+Z: A/B toggle between the current state and the previous one
   // (repeated presses flip back and forth to compare the last change).
@@ -308,6 +336,22 @@ export default function Editor() {
     [zoomAt, stageSize]
   );
 
+  const toggleFullscreen = useCallback(() => {
+    const el = stageRef.current;
+    if (!el) return;
+    if (document.fullscreenElement) document.exitFullscreen?.();
+    else el.requestFullscreen?.();
+  }, []);
+
+  // re-fit the image when entering/exiting fullscreen (stage size changes)
+  useEffect(() => {
+    const onFs = () => {
+      pendingFit.current = true;
+    };
+    document.addEventListener("fullscreenchange", onFs);
+    return () => document.removeEventListener("fullscreenchange", onFs);
+  }, []);
+
   // native wheel listener so we can preventDefault (React onWheel is passive)
   useEffect(() => {
     const el = stageRef.current;
@@ -328,16 +372,17 @@ export default function Editor() {
   applyCropRef.current = applyCrop;
   const downloadRef = useRef(doDownload);
   downloadRef.current = doDownload;
+  const fitRef = useRef(fitToScreen);
+  fitRef.current = fitToScreen;
+  const requestOpenRef = useRef(requestOpen);
+  requestOpenRef.current = requestOpen;
 
   // space-to-pan + shortcuts
   useEffect(() => {
     const isTyping = (t: EventTarget | null) =>
       t instanceof HTMLElement && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.tagName === "SELECT");
     const down = (e: KeyboardEvent) => {
-      if (e.code === "Space" && !isTyping(e.target)) {
-        e.preventDefault();
-        setSpaceDown(true);
-      } else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "z") {
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "z") {
         e.preventDefault();
         e.shiftKey ? stepBack() : toggleLast();
       } else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "y") {
@@ -346,30 +391,30 @@ export default function Editor() {
       } else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "s") {
         e.preventDefault();
         void downloadRef.current(); // save full-res PNG
+      } else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "o") {
+        e.preventDefault();
+        requestOpenRef.current(); // open new photo (guards unsaved changes)
       } else if (!e.ctrlKey && !e.metaKey && !e.altKey && !isTyping(e.target)) {
         // single-key tool / panel shortcuts
         const k = e.key.toLowerCase();
         if (k === "c") setTool("crop");
         else if (k === "a") setTool("ai");
-        else if (k === "v") setTool("move");
+        else if (k === "v" || k === "escape") setTool("none");
         else if (k === "i") setPanelTab("settings");
         else if (k === "t") setPanelTab("transform");
+        else if (k === "f") toggleFullscreen();
+        else if (k === "r") fitRef.current();
         else if (e.key === "Enter" && toolRef.current === "crop") applyCropRef.current();
       }
     };
-    const up = (e: KeyboardEvent) => e.code === "Space" && setSpaceDown(false);
     window.addEventListener("keydown", down);
-    window.addEventListener("keyup", up);
-    return () => {
-      window.removeEventListener("keydown", down);
-      window.removeEventListener("keyup", up);
-    };
+    return () => window.removeEventListener("keydown", down);
   }, [toggleLast, stepBack, stepForward]);
 
+  // Panning is always available. In crop mode, drags that start on the crop
+  // box/handles are captured by the overlay; drags anywhere else pan the view.
   const pan = useRef<{ x: number; y: number; vx: number; vy: number } | null>(null);
-  const canPan = tool === "move" || spaceDown;
   const onStagePointerDown = (e: React.PointerEvent) => {
-    if (!canPan) return;
     (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
     pan.current = { x: e.clientX, y: e.clientY, vx: view.x, vy: view.y };
     setPanning(true);
@@ -392,7 +437,7 @@ export default function Editor() {
   }, [img, view]);
 
   const filter = adjustmentsToFilter(adjust);
-  const cursor = panning ? "grabbing" : canPan ? "grab" : "default";
+  const cursor = panning ? "grabbing" : tool === "crop" ? "default" : "grab";
 
   if (!current) return <Dropzone onFile={openFile} error={error} />;
 
@@ -404,11 +449,26 @@ export default function Editor() {
         setTool={setTool}
         onZoomIn={() => zoomButton(1.25)}
         onZoomOut={() => zoomButton(1 / 1.25)}
+        onFit={() => fitToScreen()}
+        onFullscreen={toggleFullscreen}
       />
 
       {/* CENTER STAGE */}
       <div style={{ flex: 1, display: "flex", flexDirection: "column", minWidth: 0 }}>
-        <TopBar onToggle={toggleLast} onBack={stepBack} onForward={stepForward} canBack={index > 0} canForward={index < history.length - 1} onOpen={openFile} onDownload={doDownload} step={index} total={history.length} />
+        <TopBar
+          onToggle={toggleLast}
+          onBack={stepBack}
+          onForward={stepForward}
+          canBack={index > 0}
+          canForward={index < history.length - 1}
+          onOpen={requestOpen}
+          onDownload={doDownload}
+          step={index}
+          total={history.length}
+          cropMode={tool === "crop"}
+          cropAspect={cropAspect}
+          onCropAspect={chooseCropAspect}
+        />
         <div
           ref={stageRef}
           onPointerDown={onStagePointerDown}
@@ -500,27 +560,7 @@ export default function Editor() {
 
         {tool === "crop" && (
           <Section title="Crop">
-            <span style={label}>Aspect ratio</span>
-            <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
-              {([["Free", null], ["1:1", 1], ["16:9", 16 / 9], ["9:16", 9 / 16], ["4:3", 4 / 3], ["3:4", 3 / 4], ["3:2", 3 / 2], ["2:3", 2 / 3]] as [string, number | null][]).map(
-                ([lbl, r]) => (
-                  <button
-                    key={lbl}
-                    onClick={() => chooseCropAspect(r)}
-                    style={{
-                      fontSize: 11,
-                      padding: "5px 9px",
-                      background: cropAspect === r || (r === null && cropAspect === null) ? "var(--accent)" : undefined,
-                      borderColor: cropAspect === r || (r === null && cropAspect === null) ? "var(--accent)" : undefined,
-                      color: cropAspect === r || (r === null && cropAspect === null) ? "#fff" : undefined,
-                    }}
-                  >
-                    {lbl}
-                  </button>
-                )
-              )}
-            </div>
-            <p style={hint}>Drag the handles - pull them past the photo edge to crop out. Press Enter to apply.</p>
+            <p style={hint}>Pick a ratio in the top bar, or drag freely. Pull handles past the edge to crop out. Press Enter to apply.</p>
             <div style={{ display: "flex", gap: 8 }}>
               <button style={{ flex: 1 }} onClick={() => { setCrop(FULL_CROP); chooseCropAspect(null); }}>Reset</button>
               <button className="primary" style={{ flex: 1 }} onClick={applyCrop}>Apply crop</button>
@@ -549,6 +589,52 @@ export default function Editor() {
           setTab={setPanelTab}
         />
       </aside>
+
+      {/* hidden picker used by Open / Ctrl+O */}
+      <input
+        ref={openInputRef}
+        type="file"
+        accept="image/*"
+        style={{ display: "none" }}
+        onChange={(e) => {
+          const f = e.target.files?.[0];
+          e.target.value = ""; // allow re-picking the same file
+          if (f) void openFile(f);
+        }}
+      />
+
+      {/* unsaved-changes confirmation */}
+      {confirmOpen && (
+        <div style={modalBackdrop} onClick={() => setConfirmOpen(false)}>
+          <div style={modalCard} onClick={(e) => e.stopPropagation()}>
+            <h2 style={{ margin: "0 0 6px", fontSize: 17 }}>Unsaved changes</h2>
+            <p style={{ margin: "0 0 18px", fontSize: 13, color: "var(--muted)", lineHeight: 1.5 }}>
+              You have edits that haven&apos;t been saved. Opening a new photo will discard them.
+            </p>
+            <div style={{ display: "flex", gap: 8, justifyContent: "flex-end", flexWrap: "wrap" }}>
+              <button onClick={() => setConfirmOpen(false)}>Cancel</button>
+              <button
+                onClick={async () => {
+                  setConfirmOpen(false);
+                  await doDownload();
+                  triggerPicker();
+                }}
+              >
+                Save &amp; open
+              </button>
+              <button
+                className="primary"
+                onClick={() => {
+                  setConfirmOpen(false);
+                  triggerPicker();
+                }}
+              >
+                Discard &amp; open
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
@@ -560,11 +646,12 @@ function ToolRail(props: {
   setTool: (t: Tool) => void;
   onZoomIn: () => void;
   onZoomOut: () => void;
+  onFit: () => void;
+  onFullscreen: () => void;
 }) {
   const tools: [Tool, string, string][] = [
-    ["move", "🖐", "Move / Pan  (V, or hold Space)"],
     ["crop", "▢", "Crop  (C)"],
-    ["ai", "✨", "AI Edit"],
+    ["ai", "✨", "AI Edit  (A)"],
   ];
   return (
     <div style={{ width: 56, background: "var(--panel)", borderRight: "1px solid var(--border)", display: "flex", flexDirection: "column", alignItems: "center", padding: "10px 0", gap: 6 }}>
@@ -576,6 +663,8 @@ function ToolRail(props: {
       <div style={{ flex: 1 }} />
       <RailButton title="Zoom in  (scroll up)" onClick={props.onZoomIn}>＋</RailButton>
       <RailButton title="Zoom out  (scroll down)" onClick={props.onZoomOut}>－</RailButton>
+      <RailButton title="Fit to window  (R)" onClick={props.onFit}>⤢</RailButton>
+      <RailButton title="Fullscreen  (F)" onClick={props.onFullscreen}>⛶</RailButton>
     </div>
   );
 }
@@ -605,7 +694,7 @@ function RailButton({ active, title, onClick, children }: { active?: boolean; ti
 }
 
 function TopBar(props: {
-  onOpen: (f: File) => void;
+  onOpen: () => void;
   onToggle: () => void;
   onBack: () => void;
   onForward: () => void;
@@ -614,15 +703,40 @@ function TopBar(props: {
   onDownload: () => void;
   step: number;
   total: number;
+  cropMode: boolean;
+  cropAspect: number | null;
+  onCropAspect: (n: number | null) => void;
 }) {
-  const fileRef = useRef<HTMLInputElement>(null);
   return (
     <header style={{ height: 52, display: "flex", alignItems: "center", gap: 10, padding: "0 16px", borderBottom: "1px solid var(--border)", background: "var(--panel)" }}>
       <strong style={{ fontSize: 15, letterSpacing: 0.3 }}>Photo<span style={{ color: "var(--accent)" }}>AI</span></strong>
+      {props.cropMode && (
+        <div style={{ display: "flex", alignItems: "center", gap: 6, marginLeft: 10, paddingLeft: 12, borderLeft: "1px solid var(--border)", overflowX: "auto" }}>
+          <span style={{ fontSize: 11, color: "var(--muted)", whiteSpace: "nowrap" }}>Ratio</span>
+          {CROP_RATIOS.map(([lbl, r]) => {
+            const active = props.cropAspect === r || (r === null && props.cropAspect === null);
+            return (
+              <button
+                key={lbl}
+                onClick={() => props.onCropAspect(r)}
+                style={{
+                  fontSize: 11,
+                  padding: "4px 8px",
+                  whiteSpace: "nowrap",
+                  background: active ? "var(--accent)" : undefined,
+                  borderColor: active ? "var(--accent)" : undefined,
+                  color: active ? "#fff" : undefined,
+                }}
+              >
+                {lbl}
+              </button>
+            );
+          })}
+        </div>
+      )}
       <div style={{ flex: 1 }} />
       <span style={{ fontSize: 11, color: "var(--muted)" }}>step {props.step + 1}/{props.total}</span>
-      <input ref={fileRef} type="file" accept="image/*" style={{ display: "none" }} onChange={(e) => e.target.files?.[0] && props.onOpen(e.target.files[0])} />
-      <button onClick={() => fileRef.current?.click()}>Open</button>
+      <button title="Open photo (Ctrl+O)" onClick={props.onOpen}>Open</button>
       <button title="Toggle last change (Ctrl+Z)" onClick={props.onToggle} disabled={!props.canBack}>Toggle</button>
       <button title="Step back (Ctrl+Shift+Z)" onClick={props.onBack} disabled={!props.canBack}>◀ Back</button>
       <button title="Step forward (Ctrl+Y)" onClick={props.onForward} disabled={!props.canForward}>Fwd ▶</button>
@@ -876,6 +990,24 @@ const zoomBadge: React.CSSProperties = {
   padding: "4px 8px",
   borderRadius: 6,
   pointerEvents: "none",
+};
+const modalBackdrop: React.CSSProperties = {
+  position: "fixed",
+  inset: 0,
+  background: "rgba(0,0,0,0.55)",
+  backdropFilter: "blur(2px)",
+  display: "flex",
+  alignItems: "center",
+  justifyContent: "center",
+  zIndex: 100,
+};
+const modalCard: React.CSSProperties = {
+  width: "min(420px, calc(100% - 32px))",
+  background: "var(--panel)",
+  border: "1px solid var(--border)",
+  borderRadius: 14,
+  padding: 22,
+  boxShadow: "0 20px 60px rgba(0,0,0,0.6)",
 };
 const errorBox: React.CSSProperties = {
   background: "rgba(255,92,92,0.12)",
