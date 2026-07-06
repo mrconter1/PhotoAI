@@ -158,12 +158,30 @@ export default function Editor() {
     download(flat.src, "photoai-export.png");
   }, [flatten]);
 
-  const undo = useCallback(() => {
+  // Ctrl+Z: A/B toggle between the current state and the previous one
+  // (repeated presses flip back and forth to compare the last change).
+  const togglePair = useRef<{ a: number; b: number } | null>(null);
+  const toggleLast = useCallback(() => {
     setAdjust(NEUTRAL_ADJUSTMENTS);
+    const t = togglePair.current;
+    if (t && (index === t.a || index === t.b)) {
+      setIndex(index === t.a ? t.b : t.a);
+    } else {
+      const pair = { a: index, b: Math.max(0, index - 1) };
+      togglePair.current = pair;
+      setIndex(pair.b);
+    }
+  }, [index]);
+
+  // Ctrl+Shift+Z: walk backward through the full history, one step per press.
+  const stepBack = useCallback(() => {
+    setAdjust(NEUTRAL_ADJUSTMENTS);
+    togglePair.current = null;
     setIndex((i) => Math.max(0, i - 1));
   }, []);
-  const redo = useCallback(() => {
+  const stepForward = useCallback(() => {
     setAdjust(NEUTRAL_ADJUSTMENTS);
+    togglePair.current = null;
     setIndex((i) => Math.min(history.length - 1, i + 1));
   }, [history.length]);
 
@@ -204,10 +222,10 @@ export default function Editor() {
         setSpaceDown(true);
       } else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "z") {
         e.preventDefault();
-        e.shiftKey ? redo() : undo();
+        e.shiftKey ? stepBack() : toggleLast();
       } else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "y") {
         e.preventDefault();
-        redo();
+        stepForward();
       }
     };
     const up = (e: KeyboardEvent) => e.code === "Space" && setSpaceDown(false);
@@ -217,7 +235,7 @@ export default function Editor() {
       window.removeEventListener("keydown", down);
       window.removeEventListener("keyup", up);
     };
-  }, [undo, redo]);
+  }, [toggleLast, stepBack, stepForward]);
 
   const pan = useRef<{ x: number; y: number; vx: number; vy: number } | null>(null);
   const canPan = tool === "move" || spaceDown;
@@ -260,7 +278,7 @@ export default function Editor() {
 
       {/* CENTER STAGE */}
       <div style={{ flex: 1, display: "flex", flexDirection: "column", minWidth: 0 }}>
-        <TopBar onOpen={openFile} onUndo={undo} onRedo={redo} canUndo={index > 0} canRedo={index < history.length - 1} onDownload={doDownload} step={index} total={history.length} />
+        <TopBar onToggle={toggleLast} onBack={stepBack} onForward={stepForward} canBack={index > 0} canForward={index < history.length - 1} onOpen={openFile} onDownload={doDownload} step={index} total={history.length} />
         <div
           ref={stageRef}
           onPointerDown={onStagePointerDown}
@@ -406,10 +424,11 @@ function RailButton({ active, title, onClick, children }: { active?: boolean; ti
 
 function TopBar(props: {
   onOpen: (f: File) => void;
-  onUndo: () => void;
-  onRedo: () => void;
-  canUndo: boolean;
-  canRedo: boolean;
+  onToggle: () => void;
+  onBack: () => void;
+  onForward: () => void;
+  canBack: boolean;
+  canForward: boolean;
   onDownload: () => void;
   step: number;
   total: number;
@@ -422,8 +441,9 @@ function TopBar(props: {
       <span style={{ fontSize: 11, color: "var(--muted)" }}>step {props.step + 1}/{props.total}</span>
       <input ref={fileRef} type="file" accept="image/*" style={{ display: "none" }} onChange={(e) => e.target.files?.[0] && props.onOpen(e.target.files[0])} />
       <button onClick={() => fileRef.current?.click()}>Open</button>
-      <button title="Ctrl+Z" onClick={props.onUndo} disabled={!props.canUndo}>Undo</button>
-      <button title="Ctrl+Shift+Z" onClick={props.onRedo} disabled={!props.canRedo}>Redo</button>
+      <button title="Toggle last change (Ctrl+Z)" onClick={props.onToggle} disabled={!props.canBack}>Toggle</button>
+      <button title="Step back (Ctrl+Shift+Z)" onClick={props.onBack} disabled={!props.canBack}>◀ Back</button>
+      <button title="Step forward (Ctrl+Y)" onClick={props.onForward} disabled={!props.canForward}>Fwd ▶</button>
       <button className="primary" onClick={props.onDownload}>Download</button>
     </header>
   );
