@@ -39,6 +39,29 @@ export default function Editor() {
   const [aiAspect, setAiAspect] = useState(""); // "" = match input
   const [aiSize, setAiSize] = useState(""); // "" = model default
   const aiInputRef = useRef<HTMLTextAreaElement>(null);
+  const hydrated = useRef(false);
+
+  // restore saved AI settings (client-only) before anything overrides them
+  useEffect(() => {
+    try {
+      const raw = localStorage.getItem("photoai:ai");
+      if (raw) {
+        const s = JSON.parse(raw);
+        if (typeof s.model === "string") setAiModel(s.model);
+        if (typeof s.aspect === "string") setAiAspect(s.aspect);
+        if (typeof s.size === "string") setAiSize(s.size);
+      }
+    } catch {}
+    hydrated.current = true;
+  }, []);
+
+  // persist AI settings whenever they change (after hydration)
+  useEffect(() => {
+    if (!hydrated.current) return;
+    try {
+      localStorage.setItem("photoai:ai", JSON.stringify({ model: aiModel, aspect: aiAspect, size: aiSize }));
+    } catch {}
+  }, [aiModel, aiAspect, aiSize]);
 
   // load available image models once
   useEffect(() => {
@@ -278,8 +301,11 @@ export default function Editor() {
     setPanning(true);
   };
   const onStagePointerMove = (e: React.PointerEvent) => {
-    if (!pan.current) return;
-    setView((v) => ({ ...v, x: pan.current!.vx + (e.clientX - pan.current!.x), y: pan.current!.vy + (e.clientY - pan.current!.y) }));
+    const p = pan.current;
+    if (!p) return;
+    const cx = e.clientX;
+    const cy = e.clientY;
+    setView((v) => ({ ...v, x: p.vx + (cx - p.x), y: p.vy + (cy - p.y) }));
   };
   const onStagePointerUp = () => {
     pan.current = null;
@@ -366,11 +392,11 @@ export default function Editor() {
                 <textarea
                   ref={aiInputRef}
                   rows={1}
-                  placeholder="Describe an edit — e.g. remove the background, make it golden-hour…"
+                  placeholder="Describe an edit — e.g. remove the background… (Ctrl+Enter to run)"
                   value={aiPrompt}
                   onChange={(e) => setAiPrompt(e.target.value)}
                   onKeyDown={(e) => {
-                    if (e.key === "Enter" && !e.shiftKey) {
+                    if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) {
                       e.preventDefault();
                       void runAI();
                     }
@@ -378,7 +404,7 @@ export default function Editor() {
                   style={{ flex: 1, minHeight: 40, maxHeight: 120, background: "var(--panel-2)" }}
                   disabled={aiBusy}
                 />
-                <button className="primary" onClick={runAI} disabled={aiBusy || !aiPrompt.trim()} style={{ height: 40 }}>
+                <button className="primary" onClick={runAI} disabled={aiBusy || !aiPrompt.trim()} style={{ height: 40 }} title="Ctrl+Enter">
                   {aiBusy ? "…" : "Generate"}
                 </button>
               </div>
