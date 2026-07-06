@@ -397,6 +397,10 @@ export default function Editor() {
       } else if (!e.ctrlKey && !e.metaKey && !e.altKey && !isTyping(e.target)) {
         // single-key tool / panel shortcuts
         const k = e.key.toLowerCase();
+        const handled =
+          ["c", "a", "v", "escape", "i", "t", "f", "r"].includes(k) ||
+          (e.key === "Enter" && toolRef.current === "crop");
+        if (handled) e.preventDefault(); // don't let the key type into a field it may focus
         if (k === "c") setTool("crop");
         else if (k === "a") setTool("ai");
         else if (k === "v" || k === "escape") setTool("none");
