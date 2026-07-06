@@ -12,9 +12,8 @@ import {
   loadImage,
 } from "@/lib/image";
 import CropOverlay from "./CropOverlay";
-import BeforeAfter from "./BeforeAfter";
 
-type Tool = "move" | "crop" | "ai" | "compare";
+type Tool = "move" | "crop" | "ai";
 type Viewport = { zoom: number; x: number; y: number };
 
 const FULL_CROP: CropRect = { x: 0, y: 0, w: 1, h: 1 };
@@ -24,7 +23,6 @@ export default function Editor() {
   const [history, setHistory] = useState<string[]>([]);
   const [index, setIndex] = useState(-1);
   const current = index >= 0 ? history[index] : null;
-  const original = history[0] ?? null;
 
   const [img, setImg] = useState<HTMLImageElement | null>(null);
   const [adjust, setAdjust] = useState<Adjustments>(NEUTRAL_ADJUSTMENTS);
@@ -147,7 +145,7 @@ export default function Editor() {
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || "AI request failed.");
       pushState(data.image);
-      setTool("compare");
+      setTool("move");
     } catch (e) {
       setError(e instanceof Error ? e.message : "AI request failed.");
     } finally {
@@ -283,31 +281,25 @@ export default function Editor() {
               "repeating-conic-gradient(#141418 0% 25%, #101014 0% 50%) 50% / 24px 24px",
           }}
         >
-          {tool === "compare" && original && current ? (
-            <div style={{ position: "absolute", inset: 0, display: "flex", alignItems: "center", justifyContent: "center" }}>
-              <BeforeAfter before={original} after={current} />
-            </div>
-          ) : (
-            imgBox && (
-              <>
-                <img
-                  src={current}
-                  alt="editing"
-                  draggable={false}
-                  style={{
-                    position: "absolute",
-                    left: imgBox.left,
-                    top: imgBox.top,
-                    width: imgBox.width,
-                    height: imgBox.height,
-                    filter,
-                    imageRendering: view.zoom > 3 ? "pixelated" : "auto",
-                    boxShadow: "0 0 0 1px rgba(255,255,255,0.08), 0 12px 40px rgba(0,0,0,0.5)",
-                  }}
-                />
-                {tool === "crop" && <CropOverlay imgBox={imgBox} value={crop} onChange={setCrop} />}
-              </>
-            )
+          {imgBox && (
+            <>
+              <img
+                src={current}
+                alt="editing"
+                draggable={false}
+                style={{
+                  position: "absolute",
+                  left: imgBox.left,
+                  top: imgBox.top,
+                  width: imgBox.width,
+                  height: imgBox.height,
+                  filter,
+                  imageRendering: view.zoom > 3 ? "pixelated" : "auto",
+                  boxShadow: "0 0 0 1px rgba(255,255,255,0.08), 0 12px 40px rgba(0,0,0,0.5)",
+                }}
+              />
+              {tool === "crop" && <CropOverlay imgBox={imgBox} value={crop} onChange={setCrop} />}
+            </>
           )}
 
           {/* floating zoom badge */}
@@ -346,7 +338,7 @@ export default function Editor() {
         <RightPanel
           adjust={adjust}
           setAdjust={setAdjust}
-          onApply={() => void flatten()}
+          onCommit={() => void flatten()}
           onTransform={applyTransform}
           img={img}
           zoom={view.zoom}
@@ -372,7 +364,6 @@ function ToolRail(props: {
     ["move", "🖐", "Move / Pan  (V, or hold Space)"],
     ["crop", "▢", "Crop  (C)"],
     ["ai", "✨", "AI Edit"],
-    ["compare", "◨", "Compare before / after"],
   ];
   return (
     <div style={{ width: 56, background: "var(--panel)", borderRight: "1px solid var(--border)", display: "flex", flexDirection: "column", alignItems: "center", padding: "10px 0", gap: 6 }}>
@@ -452,7 +443,7 @@ type PanelTab = "settings" | "transform" | "info";
 function RightPanel(props: {
   adjust: Adjustments;
   setAdjust: (a: Adjustments) => void;
-  onApply: () => void;
+  onCommit: () => void; // bake current adjustments into history (auto-apply)
   onTransform: (rotate: number, flipH?: boolean, flipV?: boolean) => void;
   img: HTMLImageElement | null;
   zoom: number;
@@ -473,7 +464,8 @@ function RightPanel(props: {
     ["sepia", "Warmth", 0, 100],
     ["grayscale", "Grayscale", 0, 100],
   ];
-  const dirty = JSON.stringify(adjust) !== JSON.stringify(NEUTRAL_ADJUSTMENTS);
+  // auto-apply: bake into history when a slider gesture ends
+  const commit = () => props.onCommit();
 
   const w = img?.naturalWidth ?? 0;
   const h = img?.naturalHeight ?? 0;
@@ -520,13 +512,19 @@ function RightPanel(props: {
                 <span style={label}>{lbl}</span>
                 <span style={{ ...label, color: "var(--muted)" }}>{adjust[key]}</span>
               </div>
-              <input type="range" min={min} max={max} value={adjust[key]} onChange={(e) => setAdjust({ ...adjust, [key]: Number(e.target.value) })} />
+              <input
+                type="range"
+                min={min}
+                max={max}
+                value={adjust[key]}
+                onChange={(e) => setAdjust({ ...adjust, [key]: Number(e.target.value) })}
+                onPointerUp={commit}
+                onKeyUp={commit}
+                onTouchEnd={commit}
+              />
             </div>
           ))}
-          <div style={{ display: "flex", gap: 8 }}>
-            <button style={{ flex: 1 }} disabled={!dirty} onClick={() => setAdjust(NEUTRAL_ADJUSTMENTS)}>Reset</button>
-            <button className="primary" style={{ flex: 1 }} disabled={!dirty} onClick={props.onApply}>Apply</button>
-          </div>
+          <p style={hint}>Adjustments apply automatically. Use Ctrl+Z to step back.</p>
         </div>
       )}
 
