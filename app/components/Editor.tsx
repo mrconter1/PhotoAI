@@ -14,13 +14,13 @@ import {
 import CropOverlay from "./CropOverlay";
 import BeforeAfter from "./BeforeAfter";
 
-type Tab = "adjust" | "crop" | "ai" | "compare";
-type ContainBox = { left: number; top: number; width: number; height: number };
+type Tool = "move" | "crop" | "ai" | "compare";
+type Viewport = { zoom: number; x: number; y: number };
 
-const DEFAULT_CROP: CropRect = { x: 0.1, y: 0.1, w: 0.8, h: 0.8 };
+const FULL_CROP: CropRect = { x: 0, y: 0, w: 1, h: 1 };
 
 export default function Editor() {
-  // history of baked PNG data URLs; index points at the current state
+  // full, uncapped history of baked PNG data URLs; index = current state
   const [history, setHistory] = useState<string[]>([]);
   const [index, setIndex] = useState(-1);
   const current = index >= 0 ? history[index] : null;
@@ -28,8 +28,8 @@ export default function Editor() {
 
   const [img, setImg] = useState<HTMLImageElement | null>(null);
   const [adjust, setAdjust] = useState<Adjustments>(NEUTRAL_ADJUSTMENTS);
-  const [tab, setTab] = useState<Tab>("adjust");
-  const [crop, setCrop] = useState<CropRect>(DEFAULT_CROP);
+  const [tool, setTool] = useState<Tool>("move");
+  const [crop, setCrop] = useState<CropRect>(FULL_CROP);
 
   const [aiPrompt, setAiPrompt] = useState("");
   const [aiBusy, setAiBusy] = useState(false);
@@ -37,8 +37,11 @@ export default function Editor() {
 
   const stageRef = useRef<HTMLDivElement>(null);
   const [stageSize, setStageSize] = useState({ w: 0, h: 0 });
+  const [view, setView] = useState<Viewport>({ zoom: 1, x: 0, y: 0 });
+  const [spaceDown, setSpaceDown] = useState(false);
+  const [panning, setPanning] = useState(false);
 
-  // load the current data URL into an <img> element whenever it changes
+  // ---- image + stage sizing -------------------------------------------------
   useEffect(() => {
     if (!current) return;
     let cancelled = false;
@@ -48,24 +51,42 @@ export default function Editor() {
     };
   }, [current]);
 
-  // track stage size for crop geometry
   useEffect(() => {
     const el = stageRef.current;
     if (!el) return;
-    const ro = new ResizeObserver(() => {
-      setStageSize({ w: el.clientWidth, h: el.clientHeight });
-    });
+    const ro = new ResizeObserver(() => setStageSize({ w: el.clientWidth, h: el.clientHeight }));
     ro.observe(el);
     return () => ro.disconnect();
-  }, []);
+  }, [current]);
 
+  const fitToScreen = useCallback(
+    (image = img, size = stageSize) => {
+      if (!image || !size.w || !size.h) return;
+      const pad = 48;
+      const zoom = Math.min((size.w - pad) / image.naturalWidth, (size.h - pad) / image.naturalHeight);
+      setView({
+        zoom,
+        x: (size.w - image.naturalWidth * zoom) / 2,
+        y: (size.h - image.naturalHeight * zoom) / 2,
+      });
+    },
+    [img, stageSize]
+  );
+
+  // fit whenever a new image loads or the stage first gets a size
+  const fitKey = `${img?.src ?? ""}|${stageSize.w}x${stageSize.h}`;
+  const lastFit = useRef("");
+  useEffect(() => {
+    if (img && stageSize.w && lastFit.current !== fitKey) {
+      lastFit.current = fitKey;
+      fitToScreen(img, stageSize);
+    }
+  }, [img, stageSize, fitKey, fitToScreen]);
+
+  // ---- history --------------------------------------------------------------
   const pushState = useCallback(
     (dataUrl: string) => {
-      setHistory((h) => {
-        const next = h.slice(0, index + 1);
-        next.push(dataUrl);
-        return next;
-      });
+      setHistory((h) => [...h.slice(0, index + 1), dataUrl]);
       setIndex((i) => i + 1);
       setAdjust(NEUTRAL_ADJUSTMENTS);
     },
@@ -81,13 +102,12 @@ export default function Editor() {
       setIndex(0);
       setImg(el);
       setAdjust(NEUTRAL_ADJUSTMENTS);
-      setTab("adjust");
+      setTool("move");
     } catch (e) {
       setError(e instanceof Error ? e.message : "Could not open image.");
     }
   }, []);
 
-  // flatten live adjustments into a new committed raster (if any are non-neutral)
   const flatten = useCallback(async (): Promise<HTMLImageElement> => {
     if (!img) throw new Error("No image.");
     const dirty = adjustmentsToFilter(adjust) !== adjustmentsToFilter(NEUTRAL_ADJUSTMENTS);
@@ -101,23 +121,17 @@ export default function Editor() {
   const applyTransform = useCallback(
     (rotate: number, flipH = false, flipV = false) => {
       if (!img) return;
-      const baked = bake(img, { rotate, flipH, flipV }, adjust, null);
-      pushState(baked);
+      pushState(bake(img, { rotate, flipH, flipV }, adjust, null));
     },
     [img, adjust, pushState]
   );
 
   const applyCrop = useCallback(() => {
     if (!img) return;
-    const baked = bake(img, { rotate: 0, flipH: false, flipV: false }, adjust, crop);
-    pushState(baked);
-    setCrop(DEFAULT_CROP);
-    setTab("adjust");
+    pushState(bake(img, { rotate: 0, flipH: false, flipV: false }, adjust, crop));
+    setCrop(FULL_CROP);
+    setTool("move");
   }, [img, adjust, crop, pushState]);
-
-  const applyAdjust = useCallback(() => {
-    void flatten();
-  }, [flatten]);
 
   const runAI = useCallback(async () => {
     if (!img || !aiPrompt.trim()) return;
@@ -133,7 +147,7 @@ export default function Editor() {
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || "AI request failed.");
       pushState(data.image);
-      setTab("compare");
+      setTool("compare");
     } catch (e) {
       setError(e instanceof Error ? e.message : "AI request failed.");
     } finally {
@@ -155,161 +169,249 @@ export default function Editor() {
     setIndex((i) => Math.min(history.length - 1, i + 1));
   }, [history.length]);
 
-  // keyboard shortcuts
+  // ---- viewport: zoom + pan -------------------------------------------------
+  const zoomAt = useCallback((factor: number, cx: number, cy: number) => {
+    setView((v) => {
+      const zoom = Math.min(40, Math.max(0.02, v.zoom * factor));
+      const k = zoom / v.zoom;
+      return { zoom, x: cx - (cx - v.x) * k, y: cy - (cy - v.y) * k };
+    });
+  }, []);
+
+  const zoomButton = useCallback(
+    (factor: number) => zoomAt(factor, stageSize.w / 2, stageSize.h / 2),
+    [zoomAt, stageSize]
+  );
+
+  // native wheel listener so we can preventDefault (React onWheel is passive)
   useEffect(() => {
-    const onKey = (e: KeyboardEvent) => {
-      if ((e.ctrlKey || e.metaKey) && e.key === "z" && !e.shiftKey) {
+    const el = stageRef.current;
+    if (!el) return;
+    const onWheel = (e: WheelEvent) => {
+      e.preventDefault();
+      const r = el.getBoundingClientRect();
+      zoomAt(e.deltaY < 0 ? 1.12 : 1 / 1.12, e.clientX - r.left, e.clientY - r.top);
+    };
+    el.addEventListener("wheel", onWheel, { passive: false });
+    return () => el.removeEventListener("wheel", onWheel);
+  }, [zoomAt, current]);
+
+  // space-to-pan + shortcuts
+  useEffect(() => {
+    const isTyping = (t: EventTarget | null) =>
+      t instanceof HTMLElement && (t.tagName === "INPUT" || t.tagName === "TEXTAREA");
+    const down = (e: KeyboardEvent) => {
+      if (e.code === "Space" && !isTyping(e.target)) {
         e.preventDefault();
-        undo();
-      } else if ((e.ctrlKey || e.metaKey) && (e.key === "y" || (e.key === "z" && e.shiftKey))) {
+        setSpaceDown(true);
+      } else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "z") {
+        e.preventDefault();
+        e.shiftKey ? redo() : undo();
+      } else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "y") {
         e.preventDefault();
         redo();
       }
     };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
+    const up = (e: KeyboardEvent) => e.code === "Space" && setSpaceDown(false);
+    window.addEventListener("keydown", down);
+    window.addEventListener("keyup", up);
+    return () => {
+      window.removeEventListener("keydown", down);
+      window.removeEventListener("keyup", up);
+    };
   }, [undo, redo]);
 
-  // contain-fit box of the image inside the stage (image is always upright)
-  const imgBox: ContainBox | null = useMemo(() => {
-    if (!img || !stageSize.w || !stageSize.h) return null;
-    const scale = Math.min(stageSize.w / img.naturalWidth, stageSize.h / img.naturalHeight);
-    const width = img.naturalWidth * scale;
-    const height = img.naturalHeight * scale;
-    return { left: (stageSize.w - width) / 2, top: (stageSize.h - height) / 2, width, height };
-  }, [img, stageSize]);
+  const pan = useRef<{ x: number; y: number; vx: number; vy: number } | null>(null);
+  const canPan = tool === "move" || spaceDown;
+  const onStagePointerDown = (e: React.PointerEvent) => {
+    if (!canPan) return;
+    (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
+    pan.current = { x: e.clientX, y: e.clientY, vx: view.x, vy: view.y };
+    setPanning(true);
+  };
+  const onStagePointerMove = (e: React.PointerEvent) => {
+    if (!pan.current) return;
+    setView((v) => ({ ...v, x: pan.current!.vx + (e.clientX - pan.current!.x), y: pan.current!.vy + (e.clientY - pan.current!.y) }));
+  };
+  const onStagePointerUp = () => {
+    pan.current = null;
+    setPanning(false);
+  };
+
+  const imgBox = useMemo(() => {
+    if (!img) return null;
+    return { left: view.x, top: view.y, width: img.naturalWidth * view.zoom, height: img.naturalHeight * view.zoom };
+  }, [img, view]);
 
   const filter = adjustmentsToFilter(adjust);
+  const cursor = panning ? "grabbing" : canPan ? "grab" : "default";
 
   if (!current) return <Dropzone onFile={openFile} error={error} />;
 
   return (
     <div style={{ display: "flex", height: "100vh" }}>
-      {/* main stage */}
+      {/* LEFT TOOL RAIL */}
+      <ToolRail
+        tool={tool}
+        setTool={setTool}
+        onZoomIn={() => zoomButton(1.25)}
+        onZoomOut={() => zoomButton(1 / 1.25)}
+        onFit={() => fitToScreen()}
+        zoom={view.zoom}
+      />
+
+      {/* CENTER STAGE */}
       <div style={{ flex: 1, display: "flex", flexDirection: "column", minWidth: 0 }}>
-        <TopBar
-          onOpen={openFile}
-          onUndo={undo}
-          onRedo={redo}
-          canUndo={index > 0}
-          canRedo={index < history.length - 1}
-          onDownload={doDownload}
-        />
+        <TopBar onOpen={openFile} onUndo={undo} onRedo={redo} canUndo={index > 0} canRedo={index < history.length - 1} onDownload={doDownload} step={index} total={history.length} />
         <div
           ref={stageRef}
-          style={{
-            position: "relative",
-            flex: 1,
-            display: "flex",
-            alignItems: "center",
-            justifyContent: "center",
-            background: "radial-gradient(circle at 50% 30%, #1a1a20, #0b0b0e)",
-            overflow: "hidden",
-          }}
+          onPointerDown={onStagePointerDown}
+          onPointerMove={onStagePointerMove}
+          onPointerUp={onStagePointerUp}
           onDragOver={(e) => e.preventDefault()}
           onDrop={(e) => {
             e.preventDefault();
             const f = e.dataTransfer.files?.[0];
             if (f) void openFile(f);
           }}
+          style={{
+            position: "relative",
+            flex: 1,
+            overflow: "hidden",
+            cursor,
+            background:
+              "repeating-conic-gradient(#141418 0% 25%, #101014 0% 50%) 50% / 24px 24px",
+          }}
         >
-          {tab === "compare" && original && current ? (
-            <BeforeAfter before={original} after={current} />
+          {tool === "compare" && original && current ? (
+            <div style={{ position: "absolute", inset: 0, display: "flex", alignItems: "center", justifyContent: "center" }}>
+              <BeforeAfter before={original} after={current} />
+            </div>
           ) : (
-            <>
-              {/* eslint-disable-next-line @next/next/no-img-element */}
-              <img
-                src={current}
-                alt="editing"
-                style={{
-                  maxWidth: "100%",
-                  maxHeight: "100%",
-                  objectFit: "contain",
-                  filter,
-                  boxShadow: "0 10px 40px rgba(0,0,0,0.5)",
-                }}
-                draggable={false}
-              />
-              {tab === "crop" && imgBox && (
-                <CropOverlay imgBox={imgBox} value={crop} onChange={setCrop} />
-              )}
-            </>
+            imgBox && (
+              <>
+                <img
+                  src={current}
+                  alt="editing"
+                  draggable={false}
+                  style={{
+                    position: "absolute",
+                    left: imgBox.left,
+                    top: imgBox.top,
+                    width: imgBox.width,
+                    height: imgBox.height,
+                    filter,
+                    imageRendering: view.zoom > 3 ? "pixelated" : "auto",
+                    boxShadow: "0 0 0 1px rgba(255,255,255,0.08), 0 12px 40px rgba(0,0,0,0.5)",
+                  }}
+                />
+                {tool === "crop" && <CropOverlay imgBox={imgBox} value={crop} onChange={setCrop} />}
+              </>
+            )
           )}
+
+          {/* floating zoom badge */}
+          <div style={zoomBadge}>{Math.round(view.zoom * 100)}%</div>
         </div>
       </div>
 
-      {/* sidebar */}
-      <aside
-        style={{
-          width: 320,
-          background: "var(--panel)",
-          borderLeft: "1px solid var(--border)",
-          display: "flex",
-          flexDirection: "column",
-        }}
-      >
-        <Tabs tab={tab} setTab={setTab} />
-        <div style={{ padding: 16, overflowY: "auto", flex: 1 }}>
-          {error && <div style={errorBox}>{error}</div>}
+      {/* RIGHT SETTINGS (always visible) */}
+      <aside style={{ width: 300, background: "var(--panel)", borderLeft: "1px solid var(--border)", display: "flex", flexDirection: "column", overflowY: "auto" }}>
+        {error && <div style={{ ...errorBox, margin: 16 }}>{error}</div>}
 
-          {tab === "adjust" && (
-            <AdjustPanel adjust={adjust} setAdjust={setAdjust} onApply={applyAdjust} onTransform={applyTransform} />
-          )}
-
-          {tab === "crop" && (
-            <div style={{ display: "grid", gap: 12 }}>
-              <p style={hint}>Drag the corners or the box to frame your crop, then apply.</p>
-              <div style={{ display: "flex", gap: 8 }}>
-                <button style={{ flex: 1 }} onClick={() => setCrop(DEFAULT_CROP)}>
-                  Reset
-                </button>
-                <button className="primary" style={{ flex: 1 }} onClick={applyCrop}>
-                  Apply crop
-                </button>
-              </div>
+        {tool === "crop" && (
+          <Section title="Crop">
+            <p style={hint}>Drag the handles - pull them past the photo edge to crop out (extend the canvas).</p>
+            <div style={{ display: "flex", gap: 8 }}>
+              <button style={{ flex: 1 }} onClick={() => setCrop(FULL_CROP)}>Reset</button>
+              <button className="primary" style={{ flex: 1 }} onClick={applyCrop}>Apply crop</button>
             </div>
-          )}
+          </Section>
+        )}
 
-          {tab === "ai" && (
-            <div style={{ display: "grid", gap: 12 }}>
-              <p style={hint}>
-                Describe the edit. Your photo is sent to Google&apos;s image model and the result comes back
-                as a new layer.
-              </p>
-              <textarea
-                rows={5}
-                placeholder="e.g. Remove the background and make it a clean white studio shot"
-                value={aiPrompt}
-                onChange={(e) => setAiPrompt(e.target.value)}
-              />
-              <button className="primary" onClick={runAI} disabled={aiBusy || !aiPrompt.trim()}>
-                {aiBusy ? "Generating…" : "Run AI edit"}
-              </button>
-              <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
-                {["Remove background", "Make it black & white film", "Enhance and sharpen", "Add golden-hour lighting"].map(
-                  (p) => (
-                    <button key={p} style={{ fontSize: 11, padding: "5px 8px" }} onClick={() => setAiPrompt(p)}>
-                      {p}
-                    </button>
-                  )
-                )}
-              </div>
+        {tool === "ai" && (
+          <Section title="AI Edit">
+            <p style={hint}>Describe a change. Your photo is sent to Google&apos;s image model and returned as a new step.</p>
+            <textarea rows={5} placeholder="e.g. Remove the background and make it a clean white studio shot" value={aiPrompt} onChange={(e) => setAiPrompt(e.target.value)} />
+            <button className="primary" onClick={runAI} disabled={aiBusy || !aiPrompt.trim()}>{aiBusy ? "Generating…" : "Run AI edit"}</button>
+            <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
+              {["Remove background", "Black & white film", "Enhance & sharpen", "Golden-hour light"].map((p) => (
+                <button key={p} style={{ fontSize: 11, padding: "5px 8px" }} onClick={() => setAiPrompt(p)}>{p}</button>
+              ))}
             </div>
-          )}
+          </Section>
+        )}
 
-          {tab === "compare" && (
-            <p style={hint}>
-              Drag the divider on the canvas to compare the original with your current edit. Keep editing from any
-              other tab.
-            </p>
-          )}
-        </div>
+        {/* Tabbed settings — always available */}
+        <RightPanel
+          adjust={adjust}
+          setAdjust={setAdjust}
+          onApply={() => void flatten()}
+          onTransform={applyTransform}
+          img={img}
+          zoom={view.zoom}
+          step={index}
+          total={history.length}
+        />
       </aside>
     </div>
   );
 }
 
-/* ---------- sub-views ---------- */
+/* =========================== sub-views =========================== */
+
+function ToolRail(props: {
+  tool: Tool;
+  setTool: (t: Tool) => void;
+  onZoomIn: () => void;
+  onZoomOut: () => void;
+  onFit: () => void;
+  zoom: number;
+}) {
+  const tools: [Tool, string, string][] = [
+    ["move", "🖐", "Move / Pan  (V, or hold Space)"],
+    ["crop", "▢", "Crop  (C)"],
+    ["ai", "✨", "AI Edit"],
+    ["compare", "◨", "Compare before / after"],
+  ];
+  return (
+    <div style={{ width: 56, background: "var(--panel)", borderRight: "1px solid var(--border)", display: "flex", flexDirection: "column", alignItems: "center", padding: "10px 0", gap: 6 }}>
+      {tools.map(([id, icon, title]) => (
+        <RailButton key={id} active={props.tool === id} title={title} onClick={() => props.setTool(id)}>
+          {icon}
+        </RailButton>
+      ))}
+      <div style={{ flex: 1 }} />
+      <RailButton title="Zoom in  (scroll up)" onClick={props.onZoomIn}>＋</RailButton>
+      <RailButton title="Zoom out  (scroll down)" onClick={props.onZoomOut}>－</RailButton>
+      <RailButton title="Fit to screen" onClick={props.onFit}>⤢</RailButton>
+    </div>
+  );
+}
+
+function RailButton({ active, title, onClick, children }: { active?: boolean; title: string; onClick: () => void; children: React.ReactNode }) {
+  return (
+    <button
+      title={title}
+      onClick={onClick}
+      style={{
+        width: 40,
+        height: 40,
+        padding: 0,
+        fontSize: 18,
+        borderRadius: 8,
+        background: active ? "var(--accent)" : "transparent",
+        border: active ? "1px solid var(--accent)" : "1px solid transparent",
+        color: active ? "#fff" : "var(--text)",
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "center",
+      }}
+    >
+      {children}
+    </button>
+  );
+}
 
 function TopBar(props: {
   onOpen: (f: File) => void;
@@ -318,129 +420,144 @@ function TopBar(props: {
   canUndo: boolean;
   canRedo: boolean;
   onDownload: () => void;
+  step: number;
+  total: number;
 }) {
   const fileRef = useRef<HTMLInputElement>(null);
   return (
-    <header
-      style={{
-        height: 52,
-        display: "flex",
-        alignItems: "center",
-        gap: 10,
-        padding: "0 16px",
-        borderBottom: "1px solid var(--border)",
-        background: "var(--panel)",
-      }}
-    >
-      <strong style={{ fontSize: 15, letterSpacing: 0.3 }}>
-        Photo<span style={{ color: "var(--accent)" }}>AI</span>
-      </strong>
+    <header style={{ height: 52, display: "flex", alignItems: "center", gap: 10, padding: "0 16px", borderBottom: "1px solid var(--border)", background: "var(--panel)" }}>
+      <strong style={{ fontSize: 15, letterSpacing: 0.3 }}>Photo<span style={{ color: "var(--accent)" }}>AI</span></strong>
       <div style={{ flex: 1 }} />
-      <input
-        ref={fileRef}
-        type="file"
-        accept="image/*"
-        style={{ display: "none" }}
-        onChange={(e) => e.target.files?.[0] && props.onOpen(e.target.files[0])}
-      />
+      <span style={{ fontSize: 11, color: "var(--muted)" }}>step {props.step + 1}/{props.total}</span>
+      <input ref={fileRef} type="file" accept="image/*" style={{ display: "none" }} onChange={(e) => e.target.files?.[0] && props.onOpen(e.target.files[0])} />
       <button onClick={() => fileRef.current?.click()}>Open</button>
-      <button onClick={props.onUndo} disabled={!props.canUndo}>
-        Undo
-      </button>
-      <button onClick={props.onRedo} disabled={!props.canRedo}>
-        Redo
-      </button>
-      <button className="primary" onClick={props.onDownload}>
-        Download
-      </button>
+      <button title="Ctrl+Z" onClick={props.onUndo} disabled={!props.canUndo}>Undo</button>
+      <button title="Ctrl+Shift+Z" onClick={props.onRedo} disabled={!props.canRedo}>Redo</button>
+      <button className="primary" onClick={props.onDownload}>Download</button>
     </header>
   );
 }
 
-function Tabs({ tab, setTab }: { tab: Tab; setTab: (t: Tab) => void }) {
-  const items: [Tab, string][] = [
-    ["adjust", "Adjust"],
-    ["crop", "Crop"],
-    ["ai", "AI Edit"],
-    ["compare", "Compare"],
-  ];
+function Section({ title, children }: { title: string; children: React.ReactNode }) {
   return (
-    <div style={{ display: "flex", borderBottom: "1px solid var(--border)" }}>
-      {items.map(([id, label]) => (
-        <button
-          key={id}
-          onClick={() => setTab(id)}
-          style={{
-            flex: 1,
-            border: "none",
-            borderRadius: 0,
-            background: tab === id ? "var(--panel-2)" : "transparent",
-            color: tab === id ? "var(--text)" : "var(--muted)",
-            borderBottom: tab === id ? "2px solid var(--accent)" : "2px solid transparent",
-            padding: "12px 4px",
-            fontSize: 12,
-            fontWeight: tab === id ? 600 : 400,
-          }}
-        >
-          {label}
-        </button>
-      ))}
+    <div style={{ padding: 16, borderBottom: "1px solid var(--border)", display: "grid", gap: 12 }}>
+      <span style={{ fontSize: 12, fontWeight: 700, textTransform: "uppercase", letterSpacing: 0.6, color: "var(--muted)" }}>{title}</span>
+      {children}
     </div>
   );
 }
 
-function AdjustPanel(props: {
+type PanelTab = "settings" | "transform" | "info";
+
+function RightPanel(props: {
   adjust: Adjustments;
   setAdjust: (a: Adjustments) => void;
   onApply: () => void;
   onTransform: (rotate: number, flipH?: boolean, flipV?: boolean) => void;
+  img: HTMLImageElement | null;
+  zoom: number;
+  step: number;
+  total: number;
 }) {
-  const { adjust, setAdjust } = props;
+  const { adjust, setAdjust, img } = props;
+  const [pt, setPt] = useState<PanelTab>("settings");
+  const tabs: [PanelTab, string][] = [
+    ["settings", "Image Settings"],
+    ["transform", "Transform"],
+    ["info", "Information"],
+  ];
   const sliders: [keyof Adjustments, string, number, number][] = [
     ["brightness", "Brightness", 0, 200],
     ["contrast", "Contrast", 0, 200],
     ["saturation", "Saturation", 0, 200],
-    ["sepia", "Warmth (sepia)", 0, 100],
+    ["sepia", "Warmth", 0, 100],
     ["grayscale", "Grayscale", 0, 100],
-    ["blur", "Blur", 0, 12],
   ];
+  const dirty = JSON.stringify(adjust) !== JSON.stringify(NEUTRAL_ADJUSTMENTS);
+
+  const w = img?.naturalWidth ?? 0;
+  const h = img?.naturalHeight ?? 0;
+  const gcd = (a: number, b: number): number => (b ? gcd(b, a % b) : a);
+  const g = w && h ? gcd(w, h) : 1;
+  const info: [string, string][] = [
+    ["Dimensions", w ? `${w} × ${h} px` : "-"],
+    ["Megapixels", w ? `${((w * h) / 1_000_000).toFixed(2)} MP` : "-"],
+    ["Aspect ratio", w ? `${w / g} : ${h / g}` : "-"],
+    ["Orientation", w ? (w > h ? "Landscape" : w < h ? "Portrait" : "Square") : "-"],
+    ["Zoom", `${Math.round(props.zoom * 100)}%`],
+    ["History step", `${props.step + 1} / ${props.total}`],
+  ];
+
   return (
-    <div style={{ display: "grid", gap: 16 }}>
-      <div style={{ display: "grid", gap: 6 }}>
-        <span style={label}>Transform</span>
-        <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
-          <button onClick={() => props.onTransform(90)}>Rotate ⟳</button>
-          <button onClick={() => props.onTransform(-90)}>Rotate ⟲</button>
-          <button onClick={() => props.onTransform(0, true, false)}>Flip ⇋</button>
-          <button onClick={() => props.onTransform(0, false, true)}>Flip ⇅</button>
-        </div>
+    <>
+      <div style={{ display: "flex", borderTop: "1px solid var(--border)", borderBottom: "1px solid var(--border)", position: "sticky", top: 0, background: "var(--panel)", zIndex: 1 }}>
+        {tabs.map(([id, lbl]) => (
+          <button
+            key={id}
+            onClick={() => setPt(id)}
+            style={{
+              flex: 1,
+              border: "none",
+              borderRadius: 0,
+              background: pt === id ? "var(--panel-2)" : "transparent",
+              color: pt === id ? "var(--text)" : "var(--muted)",
+              borderBottom: pt === id ? "2px solid var(--accent)" : "2px solid transparent",
+              padding: "11px 2px",
+              fontSize: 11,
+              fontWeight: pt === id ? 600 : 400,
+            }}
+          >
+            {lbl}
+          </button>
+        ))}
       </div>
 
-      {sliders.map(([key, lbl, min, max]) => (
-        <div key={key} style={{ display: "grid", gap: 4 }}>
-          <div style={{ display: "flex", justifyContent: "space-between" }}>
-            <span style={label}>{lbl}</span>
-            <span style={{ ...label, color: "var(--muted)" }}>{adjust[key]}</span>
+      {pt === "settings" && (
+        <div style={{ padding: 16, display: "grid", gap: 14 }}>
+          {sliders.map(([key, lbl, min, max]) => (
+            <div key={key} style={{ display: "grid", gap: 4 }}>
+              <div style={{ display: "flex", justifyContent: "space-between" }}>
+                <span style={label}>{lbl}</span>
+                <span style={{ ...label, color: "var(--muted)" }}>{adjust[key]}</span>
+              </div>
+              <input type="range" min={min} max={max} value={adjust[key]} onChange={(e) => setAdjust({ ...adjust, [key]: Number(e.target.value) })} />
+            </div>
+          ))}
+          <div style={{ display: "flex", gap: 8 }}>
+            <button style={{ flex: 1 }} disabled={!dirty} onClick={() => setAdjust(NEUTRAL_ADJUSTMENTS)}>Reset</button>
+            <button className="primary" style={{ flex: 1 }} disabled={!dirty} onClick={props.onApply}>Apply</button>
           </div>
-          <input
-            type="range"
-            min={min}
-            max={max}
-            value={adjust[key]}
-            onChange={(e) => setAdjust({ ...adjust, [key]: Number(e.target.value) })}
-          />
         </div>
-      ))}
+      )}
 
-      <div style={{ display: "flex", gap: 8 }}>
-        <button style={{ flex: 1 }} onClick={() => setAdjust(NEUTRAL_ADJUSTMENTS)}>
-          Reset
-        </button>
-        <button className="primary" style={{ flex: 1 }} onClick={props.onApply}>
-          Apply
-        </button>
-      </div>
-    </div>
+      {pt === "transform" && (
+        <div style={{ padding: 16, display: "grid", gap: 12 }}>
+          <span style={label}>Rotate</span>
+          <div style={{ display: "flex", gap: 6 }}>
+            <button style={{ flex: 1 }} onClick={() => props.onTransform(90)}>⟳ 90°</button>
+            <button style={{ flex: 1 }} onClick={() => props.onTransform(-90)}>⟲ 90°</button>
+            <button style={{ flex: 1 }} onClick={() => props.onTransform(180)}>180°</button>
+          </div>
+          <span style={label}>Flip</span>
+          <div style={{ display: "flex", gap: 6 }}>
+            <button style={{ flex: 1 }} onClick={() => props.onTransform(0, true, false)}>⇋ Horizontal</button>
+            <button style={{ flex: 1 }} onClick={() => props.onTransform(0, false, true)}>⇅ Vertical</button>
+          </div>
+          <p style={hint}>Each transform is applied immediately and added to history.</p>
+        </div>
+      )}
+
+      {pt === "info" && (
+        <div style={{ padding: 16, display: "grid", gap: 8 }}>
+          {info.map(([k, v]) => (
+            <div key={k} style={{ display: "flex", justifyContent: "space-between", fontSize: 12, padding: "6px 0", borderBottom: "1px solid var(--border)" }}>
+              <span style={{ color: "var(--muted)" }}>{k}</span>
+              <span style={{ fontWeight: 600 }}>{v}</span>
+            </div>
+          ))}
+        </div>
+      )}
+    </>
   );
 }
 
@@ -448,13 +565,7 @@ function Dropzone({ onFile, error }: { onFile: (f: File) => void; error: string 
   const fileRef = useRef<HTMLInputElement>(null);
   return (
     <div
-      style={{
-        height: "100vh",
-        display: "flex",
-        alignItems: "center",
-        justifyContent: "center",
-        background: "radial-gradient(circle at 50% 30%, #18181f, #0b0b0e)",
-      }}
+      style={{ height: "100vh", display: "flex", alignItems: "center", justifyContent: "center", background: "radial-gradient(circle at 50% 30%, #18181f, #0b0b0e)" }}
       onDragOver={(e) => e.preventDefault()}
       onDrop={(e) => {
         e.preventDefault();
@@ -462,42 +573,32 @@ function Dropzone({ onFile, error }: { onFile: (f: File) => void; error: string 
         if (f) onFile(f);
       }}
     >
-      <div
-        style={{
-          textAlign: "center",
-          padding: 48,
-          border: "2px dashed var(--border)",
-          borderRadius: 16,
-          background: "rgba(255,255,255,0.02)",
-          maxWidth: 460,
-        }}
-      >
+      <div style={{ textAlign: "center", padding: 48, border: "2px dashed var(--border)", borderRadius: 16, background: "rgba(255,255,255,0.02)", maxWidth: 460 }}>
         <div style={{ fontSize: 40, marginBottom: 8 }}>🖼️</div>
-        <h1 style={{ margin: "0 0 6px", fontSize: 24 }}>
-          Photo<span style={{ color: "var(--accent)" }}>AI</span>
-        </h1>
-        <p style={{ color: "var(--muted)", margin: "0 0 20px", fontSize: 13 }}>
-          Drop a photo here to start. Crop, adjust, and edit with AI.
-        </p>
-        <input
-          ref={fileRef}
-          type="file"
-          accept="image/*"
-          style={{ display: "none" }}
-          onChange={(e) => e.target.files?.[0] && onFile(e.target.files[0])}
-        />
-        <button className="primary" onClick={() => fileRef.current?.click()}>
-          Choose a photo
-        </button>
+        <h1 style={{ margin: "0 0 6px", fontSize: 24 }}>Photo<span style={{ color: "var(--accent)" }}>AI</span></h1>
+        <p style={{ color: "var(--muted)", margin: "0 0 20px", fontSize: 13 }}>Drop a photo here to start. Crop, adjust, and edit with AI.</p>
+        <input ref={fileRef} type="file" accept="image/*" style={{ display: "none" }} onChange={(e) => e.target.files?.[0] && onFile(e.target.files[0])} />
+        <button className="primary" onClick={() => fileRef.current?.click()}>Choose a photo</button>
         {error && <div style={{ ...errorBox, marginTop: 20 }}>{error}</div>}
       </div>
     </div>
   );
 }
 
-/* ---------- styles ---------- */
+/* =========================== styles =========================== */
 const label: React.CSSProperties = { fontSize: 12, fontWeight: 600 };
 const hint: React.CSSProperties = { fontSize: 12, color: "var(--muted)", margin: 0, lineHeight: 1.5 };
+const zoomBadge: React.CSSProperties = {
+  position: "absolute",
+  left: 12,
+  bottom: 12,
+  background: "rgba(0,0,0,0.6)",
+  color: "#fff",
+  fontSize: 11,
+  padding: "4px 8px",
+  borderRadius: 6,
+  pointerEvents: "none",
+};
 const errorBox: React.CSSProperties = {
   background: "rgba(255,92,92,0.12)",
   border: "1px solid rgba(255,92,92,0.4)",
@@ -505,5 +606,4 @@ const errorBox: React.CSSProperties = {
   padding: "8px 10px",
   borderRadius: 8,
   fontSize: 12,
-  marginBottom: 12,
 };

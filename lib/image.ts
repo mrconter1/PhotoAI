@@ -8,7 +8,6 @@ export type Adjustments = {
   saturation: number; // %
   sepia: number; // %
   grayscale: number; // %
-  blur: number; // px
 };
 
 export const NEUTRAL_ADJUSTMENTS: Adjustments = {
@@ -17,7 +16,6 @@ export const NEUTRAL_ADJUSTMENTS: Adjustments = {
   saturation: 100,
   sepia: 0,
   grayscale: 0,
-  blur: 0,
 };
 
 export type Transform = {
@@ -28,7 +26,10 @@ export type Transform = {
 
 export const IDENTITY_TRANSFORM: Transform = { rotate: 0, flipH: false, flipV: false };
 
-export type CropRect = { x: number; y: number; w: number; h: number }; // normalized 0..1
+// Normalized crop rect relative to the image. Values may fall OUTSIDE 0..1
+// to crop "out" — i.e. extend the canvas beyond the current photo (the extra
+// area becomes transparent margin).
+export type CropRect = { x: number; y: number; w: number; h: number };
 
 export function adjustmentsToFilter(a: Adjustments): string {
   return [
@@ -37,7 +38,6 @@ export function adjustmentsToFilter(a: Adjustments): string {
     `saturate(${a.saturation}%)`,
     `sepia(${a.sepia}%)`,
     `grayscale(${a.grayscale}%)`,
-    `blur(${a.blur}px)`,
   ].join(" ");
 }
 
@@ -86,7 +86,7 @@ export function bake(
   bctx.drawImage(img, -img.naturalWidth / 2, -img.naturalHeight / 2);
   bctx.restore();
 
-  // 2) crop
+  // 2) crop — may extend beyond the image; margins stay transparent
   const c = crop ?? { x: 0, y: 0, w: 1, h: 1 };
   const cx = Math.round(c.x * tW);
   const cy = Math.round(c.y * tH);
@@ -97,7 +97,9 @@ export function bake(
   out.width = cw;
   out.height = ch;
   const octx = out.getContext("2d")!;
-  octx.drawImage(buffer, cx, cy, cw, ch, 0, 0, cw, ch);
+  // Place the full transformed buffer so the crop origin lands at (0,0).
+  // A negative offset reveals transparent space (crop-out); a positive one trims.
+  octx.drawImage(buffer, -cx, -cy);
 
   return out.toDataURL("image/png");
 }
