@@ -624,7 +624,13 @@ export default function Editor() {
 
           {/* floating AI prompt bar, below the image */}
           {tool === "ai" && (
-            <div style={aiBar}>
+            <div
+              style={aiBar}
+              // The stage captures the pointer on any pointerdown that reaches
+              // it, to pan. Capture retargets the click, so a button inside this
+              // bar would never fire one. CropOverlay guards itself the same way.
+              onPointerDown={(e) => e.stopPropagation()}
+            >
               {aiBusy && (
                 <div style={aiBusyOverlay}>
                   <span className="spinner" />
