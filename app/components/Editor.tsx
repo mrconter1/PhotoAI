@@ -2,14 +2,18 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
+  AI_MAX_EDGE,
   Adjustments,
   CropRect,
   NEUTRAL_ADJUSTMENTS,
   adjustmentsToFilter,
-  bake,
+  bakeToUrl,
   download,
-  fileToDataUrl,
+  encodeForUpload,
+  formatBytes,
   loadImage,
+  openImageFile,
+  revoke,
 } from "@/lib/image";
 import CropOverlay from "./CropOverlay";
 
@@ -19,6 +23,14 @@ type PanelTab = "settings" | "transform" | "ai" | "info";
 type Viewport = { zoom: number; x: number; y: number };
 
 const FULL_CROP: CropRect = { x: 0, y: 0, w: 1, h: 1 };
+// Each history entry is a full-resolution PNG blob, so the depth is bounded:
+// 40 steps on a 24 MP photo is already north of a gigabyte of blob storage.
+const MAX_HISTORY = 40;
+const EXT: Record<string, string> = {
+  "image/png": "png",
+  "image/jpeg": "jpg",
+  "image/webp": "webp",
+};
 const CROP_RATIOS: [string, number | null][] = [
   ["Free", null],
   ["1:1", 1],
@@ -30,11 +42,45 @@ const CROP_RATIOS: [string, number | null][] = [
   ["2:3", 2 / 3],
 ];
 
+/**
+ * Turn a failed /api/ai-edit response into something readable.
+ * The route answers JSON, but a payload the platform rejects outright never
+ * reaches it - that comes back as HTML or plain text from the edge, so parsing
+ * the body as JSON unconditionally would swallow the real reason.
+ */
+async function errorFromResponse(res: Response): Promise<string> {
+  const type = res.headers.get("content-type") || "";
+  if (type.includes("application/json")) {
+    try {
+      const data = await res.json();
+      if (data?.error) return String(data.error);
+    } catch {}
+  } else {
+    const body = await res.text().catch(() => "");
+    const plain = body.replace(/<[^>]*>/g, " ").replace(/\s+/g, " ").trim();
+    if (plain && res.status !== 413) return plain.slice(0, 200);
+  }
+  if (res.status === 413) return "The upload was too large. Pick a lower resolution in AI Settings.";
+  if (res.status === 504) return "The AI edit timed out. Try a lower resolution or a simpler prompt.";
+  return `AI request failed (${res.status}).`;
+}
+
 export default function Editor() {
-  // full, uncapped history of baked PNG data URLs; index = current state
+  // history of baked PNG object URLs (blob:); index = current state
   const [history, setHistory] = useState<string[]>([]);
   const [index, setIndex] = useState(-1);
   const current = index >= 0 ? history[index] : null;
+
+  // Mirrors of the two above. pushState updates them eagerly so two pushes in
+  // the same tick (flatten + AI result) do not read a stale history.
+  const historyRef = useRef<string[]>([]);
+  const indexRef = useRef(-1);
+  historyRef.current = history;
+  indexRef.current = index;
+
+  // What each history URL actually holds. Bakes are PNG, but a model may hand
+  // back JPEG or WebP, and the export should not lie about the extension.
+  const typesRef = useRef(new Map<string, string>());
 
   const [img, setImg] = useState<HTMLImageElement | null>(null);
   const [adjust, setAdjust] = useState<Adjustments>(NEUTRAL_ADJUSTMENTS);
@@ -46,7 +92,11 @@ export default function Editor() {
   const [aiPrompt, setAiPrompt] = useState("");
   const [aiBusy, setAiBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(null); // non-fatal, e.g. downscaled on open
+  const [lastUpload, setLastUpload] = useState<string | null>(null); // what the last AI run sent
   const [savedUrl, setSavedUrl] = useState<string | null>(null); // last opened/saved image
+  const savedUrlRef = useRef<string | null>(null);
+  savedUrlRef.current = savedUrl;
   const [confirmOpen, setConfirmOpen] = useState(false); // unsaved-changes dialog
   const openInputRef = useRef<HTMLInputElement>(null);
 
@@ -178,27 +228,59 @@ export default function Editor() {
   }, [img, stageSize, fitToScreen]);
 
   // ---- history --------------------------------------------------------------
-  const pushState = useCallback(
-    (dataUrl: string) => {
-      setHistory((h) => [...h.slice(0, index + 1), dataUrl]);
-      setIndex((i) => i + 1);
-      setAdjust(NEUTRAL_ADJUSTMENTS);
-    },
-    [index]
-  );
+  // Adds a state, drops any redo branch it replaces, and keeps the depth capped.
+  // Every URL that falls out is revoked so the blob behind it is freed - without
+  // this, editing a large photo grows the tab's memory until it dies.
+  const pushState = useCallback((url: string, mime = "image/png") => {
+    typesRef.current.set(url, mime);
+    const h = historyRef.current;
+    const kept = [...h.slice(0, indexRef.current + 1), url];
+    const dropped = h.slice(indexRef.current + 1); // redo branch this edit replaces
+    const over = Math.max(0, kept.length - MAX_HISTORY);
+    if (over) {
+      dropped.push(...kept.slice(0, over));
+      togglePair.current = null; // stored indices no longer line up
+    }
+    for (const u of dropped) {
+      if (u === savedUrlRef.current) continue;
+      revoke(u);
+      typesRef.current.delete(u);
+    }
+
+    const next = over ? kept.slice(over) : kept;
+    historyRef.current = next;
+    indexRef.current = next.length - 1;
+    setHistory(next);
+    setIndex(next.length - 1);
+    setAdjust(NEUTRAL_ADJUSTMENTS);
+  }, []);
 
   const openFile = useCallback(async (file: File) => {
     setError(null);
+    setNotice(null);
+    setLastUpload(null);
     try {
-      const url = await fileToDataUrl(file);
-      const el = await loadImage(url);
+      const { url, img: el, scaledFrom } = await openImageFile(file);
+      for (const u of historyRef.current) revoke(u); // release the previous photo
+      typesRef.current.clear();
+      // A downscale on open re-encodes to PNG; otherwise it is the file itself.
+      typesRef.current.set(url, scaledFrom ? "image/png" : file.type || "image/png");
       pendingFit.current = true; // fit the newly opened image
+      togglePair.current = null;
+      historyRef.current = [url];
+      indexRef.current = 0;
       setHistory([url]);
       setIndex(0);
       setImg(el);
       setAdjust(NEUTRAL_ADJUSTMENTS);
       setSavedUrl(url); // freshly opened = clean
       setTool("none");
+      if (scaledFrom) {
+        setNotice(
+          `${scaledFrom.w} × ${scaledFrom.h} px is past what this browser can hold on a canvas - ` +
+            `editing a ${el.naturalWidth} × ${el.naturalHeight} px copy.`
+        );
+      }
     } catch (e) {
       setError(e instanceof Error ? e.message : "Could not open image.");
     }
@@ -208,25 +290,33 @@ export default function Editor() {
     if (!img) throw new Error("No image.");
     const dirty = adjustmentsToFilter(adjust) !== adjustmentsToFilter(NEUTRAL_ADJUSTMENTS);
     if (!dirty) return img;
-    const baked = bake(img, { rotate: 0, flipH: false, flipV: false }, adjust, null);
+    const baked = await bakeToUrl(img, { rotate: 0, flipH: false, flipV: false }, adjust, null);
     const el = await loadImage(baked);
     pushState(baked);
     return el;
   }, [img, adjust, pushState]);
 
   const applyTransform = useCallback(
-    (rotate: number, flipH = false, flipV = false) => {
+    async (rotate: number, flipH = false, flipV = false) => {
       if (!img) return;
-      pushState(bake(img, { rotate, flipH, flipV }, adjust, null));
+      try {
+        pushState(await bakeToUrl(img, { rotate, flipH, flipV }, adjust, null));
+      } catch (e) {
+        setError(e instanceof Error ? e.message : "Could not apply the transform.");
+      }
     },
     [img, adjust, pushState]
   );
 
-  const applyCrop = useCallback(() => {
+  const applyCrop = useCallback(async () => {
     if (!img) return;
-    pushState(bake(img, { rotate: 0, flipH: false, flipV: false }, adjust, crop));
-    setCrop(FULL_CROP);
-    setTool("none");
+    try {
+      pushState(await bakeToUrl(img, { rotate: 0, flipH: false, flipV: false }, adjust, crop));
+      setCrop(FULL_CROP);
+      setTool("none");
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Could not apply the crop.");
+    }
   }, [img, adjust, crop, pushState]);
 
   // Locked crop ratio expressed in normalized (w/h) units for the overlay.
@@ -254,20 +344,29 @@ export default function Editor() {
     setAiBusy(true);
     try {
       const flat = await flatten();
-      const res = await fetch("/api/ai-edit", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          image: flat.src,
-          prompt: aiPrompt.trim(),
-          model: aiModel || undefined,
-          aspectRatio: aiAspect || undefined,
-          imageSize: aiSize || undefined,
-        }),
-      });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error || "AI request failed.");
-      pushState(data.image);
+
+      // The full-resolution photo never leaves the browser: it is downscaled to
+      // the model's working size and compressed first, which is what keeps a
+      // 60 MP upload from timing out (or being refused) on the way to Google.
+      const { blob, width, height } = await encodeForUpload(
+        flat,
+        AI_MAX_EDGE[aiSize] ?? AI_MAX_EDGE[""]
+      );
+      setLastUpload(`${width} × ${height} px · ${formatBytes(blob.size)}`);
+
+      const form = new FormData();
+      form.append("image", blob, "image.webp");
+      form.append("prompt", aiPrompt.trim());
+      if (aiModel) form.append("model", aiModel);
+      if (aiAspect) form.append("aspectRatio", aiAspect);
+      if (aiSize) form.append("imageSize", aiSize);
+
+      const res = await fetch("/api/ai-edit", { method: "POST", body: form });
+      if (!res.ok) throw new Error(await errorFromResponse(res));
+
+      const out = await res.blob();
+      if (out.size === 0) throw new Error("The model returned an empty image.");
+      pushState(URL.createObjectURL(out), out.type || "image/png");
       setAiPrompt(""); // clear on success; stay on the AI tool for the next edit
     } catch (e) {
       setError(e instanceof Error ? e.message : "AI request failed.");
@@ -277,9 +376,15 @@ export default function Editor() {
   }, [img, aiPrompt, aiModel, aiAspect, aiSize, flatten, pushState]);
 
   const doDownload = useCallback(async () => {
-    const flat = await flatten();
-    download(flat.src, "photoai-export.png");
-    setSavedUrl(flat.src); // saving marks the current image clean
+    try {
+      const flat = await flatten();
+      const mime = typesRef.current.get(flat.src) || "image/png";
+      const ext = EXT[mime] || "png";
+      download(flat.src, `photoai-export.${ext}`);
+      setSavedUrl(flat.src); // saving marks the current image clean
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Could not export the image.");
+    }
   }, [flatten]);
 
   // Unsaved changes = current differs from the last opened/saved image,
@@ -390,7 +495,7 @@ export default function Editor() {
         stepForward();
       } else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "s") {
         e.preventDefault();
-        void downloadRef.current(); // save full-res PNG
+        void downloadRef.current(); // save the current image
       } else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "o") {
         e.preventDefault();
         requestOpenRef.current(); // open new photo (guards unsaved changes)
@@ -552,6 +657,11 @@ export default function Editor() {
                     {p}
                   </button>
                 ))}
+                <span style={{ ...hint, fontSize: 11, marginLeft: "auto", alignSelf: "center" }}>
+                  {lastUpload
+                    ? `Sent ${lastUpload}`
+                    : `Sends a copy at up to ${AI_MAX_EDGE[aiSize] ?? AI_MAX_EDGE[""]} px`}
+                </span>
               </div>
             </div>
           )}
@@ -561,6 +671,12 @@ export default function Editor() {
       {/* RIGHT SETTINGS (always visible) */}
       <aside style={{ width: 300, background: "var(--panel)", borderLeft: "1px solid var(--border)", display: "flex", flexDirection: "column", overflowY: "auto" }}>
         {error && <div style={{ ...errorBox, margin: 16 }}>{error}</div>}
+        {notice && (
+          <div style={{ ...noticeBox, margin: error ? "0 16px 16px" : 16 }}>
+            {notice}
+            <button onClick={() => setNotice(null)} style={dismissBtn} title="Dismiss">×</button>
+          </div>
+        )}
 
         {tool === "crop" && (
           <Section title="Crop">
@@ -744,7 +860,7 @@ function TopBar(props: {
       <button title="Toggle last change (Ctrl+Z)" onClick={props.onToggle} disabled={!props.canBack}>Toggle</button>
       <button title="Step back (Ctrl+Shift+Z)" onClick={props.onBack} disabled={!props.canBack}>◀ Back</button>
       <button title="Step forward (Ctrl+Y)" onClick={props.onForward} disabled={!props.canForward}>Fwd ▶</button>
-      <button className="primary" title="Save full-res PNG (Ctrl+S)" onClick={props.onDownload}>Download</button>
+      <button className="primary" title="Save image (Ctrl+S)" onClick={props.onDownload}>Download</button>
     </header>
   );
 }
@@ -1012,6 +1128,29 @@ const modalCard: React.CSSProperties = {
   borderRadius: 14,
   padding: 22,
   boxShadow: "0 20px 60px rgba(0,0,0,0.6)",
+};
+const noticeBox: React.CSSProperties = {
+  position: "relative",
+  background: "rgba(255,255,255,0.05)",
+  border: "1px solid var(--border)",
+  color: "var(--muted)",
+  padding: "8px 26px 8px 10px",
+  borderRadius: 8,
+  fontSize: 12,
+  lineHeight: 1.5,
+};
+const dismissBtn: React.CSSProperties = {
+  position: "absolute",
+  top: 2,
+  right: 2,
+  width: 22,
+  height: 22,
+  padding: 0,
+  border: "none",
+  background: "transparent",
+  color: "var(--muted)",
+  fontSize: 15,
+  lineHeight: 1,
 };
 const errorBox: React.CSSProperties = {
   background: "rgba(255,92,92,0.12)",
