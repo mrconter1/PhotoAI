@@ -8,9 +8,10 @@ export const maxDuration = 300;
 
 const DEFAULT_MODEL = process.env.GOOGLE_IMAGE_MODEL || "gemini-3.1-flash-image";
 
-// The client downscales to a few MB before uploading (lib/image.ts). This is a
-// backstop so a hand-rolled request cannot push a 100 MB frame into the model.
-const MAX_UPLOAD_BYTES = 16 * 1024 * 1024;
+// The client compresses to ~3.5 MB before uploading (lib/image.ts), and the
+// platform refuses anything past 4.5 MB before this route runs. This is the
+// backstop for whatever slips between the two.
+const MAX_UPLOAD_BYTES = 4 * 1024 * 1024;
 
 const ACCEPTED = ["image/png", "image/jpeg", "image/webp", "image/heic", "image/heif"];
 

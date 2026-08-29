@@ -38,8 +38,11 @@ explicitly rather than left to chance:
   throwing, so anything beyond the budget in `lib/image.ts` is resized on open
   and the app says so.
 - **The AI upload is downscaled and compressed**, to 1536-3072 px on the long
-  edge depending on the resolution you pick, as WebP under 4 MB. WebP keeps the
-  transparency a crop-out leaves behind, which JPEG would fill in black.
+  edge depending on the resolution you pick, as WebP under 3.5 MB. WebP keeps
+  the transparency a crop-out leaves behind, which JPEG would fill in black.
+  The 3.5 MB is measured, not guessed: a request body over 4.5 MB is rejected
+  by the platform (`FUNCTION_PAYLOAD_TOO_LARGE`) before the route runs, and the
+  multipart envelope needs headroom inside that.
 - **The request is multipart, the response is raw bytes.** Base64 in JSON adds a
   third to every byte in both directions; the route takes the image as a file
   field and streams the result back as `image/png`.

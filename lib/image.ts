@@ -56,10 +56,10 @@ export const AI_MAX_EDGE: Record<string, number> = {
   "4K": 3072,
 };
 
-// Target size for the encoded upload. Vercel Functions on Fluid Compute accept
-// up to 100 MB, but Gemini caps an inline-image request at 20 MB and anything
-// over a few MB only makes the round trip slower.
-export const AI_MAX_UPLOAD_BYTES = 4 * 1024 * 1024;
+// Target size for the encoded upload. Measured against the deployment: a body
+// over 4.5 MB is refused by the platform with FUNCTION_PAYLOAD_TOO_LARGE before
+// the route ever runs, so this leaves room for the multipart envelope on top.
+export const AI_MAX_UPLOAD_BYTES = 3.5 * 1024 * 1024;
 
 /** Scale factor (<= 1) that brings w x h inside the canvas budget. */
 export function canvasFitScale(w: number, h: number): number {
