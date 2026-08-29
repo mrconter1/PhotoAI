@@ -17,9 +17,9 @@ import {
 } from "@/lib/image";
 import CropOverlay from "./CropOverlay";
 
-// "none" = plain pan/move mode (always available); crop/ai are the active tools
-type Tool = "none" | "crop" | "ai";
-type PanelTab = "settings" | "transform" | "ai" | "info";
+// Every entry in the left sidebar is one of three kinds: an action runs at
+// once, a popup opens over the sidebar, and these open in the side panel.
+type Panel = "crop" | "adjust" | "ai" | null;
 type Viewport = { zoom: number; x: number; y: number };
 
 const FULL_CROP: CropRect = { x: 0, y: 0, w: 1, h: 1 };
@@ -84,10 +84,10 @@ export default function Editor() {
 
   const [img, setImg] = useState<HTMLImageElement | null>(null);
   const [adjust, setAdjust] = useState<Adjustments>(NEUTRAL_ADJUSTMENTS);
-  const [tool, setTool] = useState<Tool>("none");
+  const [panel, setPanel] = useState<Panel>("adjust");
+  const [transformOpen, setTransformOpen] = useState(false);
   const [crop, setCrop] = useState<CropRect>(FULL_CROP);
   const [cropAspect, setCropAspect] = useState<number | null>(null); // pixel w/h; null = free
-  const [panelTab, setPanelTab] = useState<PanelTab>("settings");
 
   const [aiPrompt, setAiPrompt] = useState("");
   const [aiBusy, setAiBusy] = useState(false);
@@ -145,8 +145,8 @@ export default function Editor() {
 
   // auto-focus the prompt when the AI tool is chosen
   useEffect(() => {
-    if (tool === "ai") aiInputRef.current?.focus();
-  }, [tool]);
+    if (panel === "ai") aiInputRef.current?.focus();
+  }, [panel]);
 
   const stageRef = useRef<HTMLDivElement>(null);
   const [stageSize, setStageSize] = useState({ w: 0, h: 0 });
@@ -274,7 +274,7 @@ export default function Editor() {
       setImg(el);
       setAdjust(NEUTRAL_ADJUSTMENTS);
       setSavedUrl(url); // freshly opened = clean
-      setTool("none");
+      setPanel("adjust");
       if (scaledFrom) {
         setNotice(
           `${scaledFrom.w} × ${scaledFrom.h} px is past what this browser can hold on a canvas - ` +
@@ -313,7 +313,7 @@ export default function Editor() {
     try {
       pushState(await bakeToUrl(img, { rotate: 0, flipH: false, flipV: false }, adjust, crop));
       setCrop(FULL_CROP);
-      setTool("none");
+      setPanel(null);
     } catch (e) {
       setError(e instanceof Error ? e.message : "Could not apply the crop.");
     }
@@ -470,9 +470,9 @@ export default function Editor() {
     return () => el.removeEventListener("wheel", onWheel);
   }, [zoomAt, current]);
 
-  // keep latest tool/applyCrop for the (stable) key handler
-  const toolRef = useRef(tool);
-  toolRef.current = tool;
+  // keep latest panel/applyCrop for the (stable) key handler
+  const panelRef = useRef(panel);
+  panelRef.current = panel;
   const applyCropRef = useRef(applyCrop);
   applyCropRef.current = applyCrop;
   const downloadRef = useRef(doDownload);
@@ -504,16 +504,18 @@ export default function Editor() {
         const k = e.key.toLowerCase();
         const handled =
           ["c", "a", "v", "escape", "i", "t", "f", "r"].includes(k) ||
-          (e.key === "Enter" && toolRef.current === "crop");
+          (e.key === "Enter" && panelRef.current === "crop");
         if (handled) e.preventDefault(); // don't let the key type into a field it may focus
-        if (k === "c") setTool("crop");
-        else if (k === "a") setTool("ai");
-        else if (k === "v" || k === "escape") setTool("none");
-        else if (k === "i") setPanelTab("settings");
-        else if (k === "t") setPanelTab("transform");
-        else if (k === "f") toggleFullscreen();
+        if (k === "c") setPanel((p) => (p === "crop" ? null : "crop"));
+        else if (k === "a") setPanel((p) => (p === "ai" ? null : "ai"));
+        else if (k === "i") setPanel((p) => (p === "adjust" ? null : "adjust"));
+        else if (k === "t") setTransformOpen((v) => !v);
+        else if (k === "v" || k === "escape") {
+          setPanel(null);
+          setTransformOpen(false);
+        } else if (k === "f") toggleFullscreen();
         else if (k === "r") fitRef.current();
-        else if (e.key === "Enter" && toolRef.current === "crop") applyCropRef.current();
+        else if (e.key === "Enter" && panelRef.current === "crop") applyCropRef.current();
       }
     };
     window.addEventListener("keydown", down);
@@ -546,38 +548,35 @@ export default function Editor() {
   }, [img, view]);
 
   const filter = adjustmentsToFilter(adjust);
-  const cursor = panning ? "grabbing" : tool === "crop" ? "default" : "grab";
+  const cursor = panning ? "grabbing" : panel === "crop" ? "default" : "grab";
+
+  const panelTitle = panel === "crop" ? "Crop" : panel === "adjust" ? "Adjustments" : "AI Edit";
+  const adjustDirty = adjustmentsToFilter(adjust) !== adjustmentsToFilter(NEUTRAL_ADJUSTMENTS);
 
   if (!current) return <Dropzone onFile={openFile} error={error} />;
 
   return (
     <div style={{ display: "flex", height: "100vh" }}>
-      {/* LEFT TOOL RAIL */}
-      <ToolRail
-        tool={tool}
-        setTool={setTool}
+      <Sidebar
+        panel={panel}
+        onPanel={(p) => setPanel((cur) => (cur === p ? null : p))}
+        transformOpen={transformOpen}
+        onTransformToggle={() => setTransformOpen((v) => !v)}
+        onTransform={(r, fh, fv) => {
+          setTransformOpen(false);
+          void applyTransform(r, fh, fv);
+        }}
+        onOpen={requestOpen}
+        onSave={doDownload}
+        dirty={dirty}
         onZoomIn={() => zoomButton(1.25)}
         onZoomOut={() => zoomButton(1 / 1.25)}
         onFit={() => fitToScreen()}
         onFullscreen={toggleFullscreen}
       />
 
-      {/* CENTER STAGE */}
+      {/* CENTER: stage above a status bar */}
       <div style={{ flex: 1, display: "flex", flexDirection: "column", minWidth: 0 }}>
-        <TopBar
-          onToggle={toggleLast}
-          onBack={stepBack}
-          onForward={stepForward}
-          canBack={index > 0}
-          canForward={index < history.length - 1}
-          onOpen={requestOpen}
-          onDownload={doDownload}
-          step={index}
-          total={history.length}
-          cropMode={tool === "crop"}
-          cropAspect={cropAspect}
-          onCropAspect={chooseCropAspect}
-        />
         <div
           ref={stageRef}
           onPointerDown={onStagePointerDown}
@@ -594,8 +593,7 @@ export default function Editor() {
             flex: 1,
             overflow: "hidden",
             cursor,
-            background:
-              "repeating-conic-gradient(#141418 0% 25%, #101014 0% 50%) 50% / 24px 24px",
+            background: "repeating-conic-gradient(#141418 0% 25%, #101014 0% 50%) 50% / 24px 24px",
           }}
         >
           {imgBox && (
@@ -615,15 +613,29 @@ export default function Editor() {
                   boxShadow: "0 0 0 1px rgba(255,255,255,0.08), 0 12px 40px rgba(0,0,0,0.5)",
                 }}
               />
-              {tool === "crop" && <CropOverlay imgBox={imgBox} value={crop} onChange={setCrop} ratio={cropNormRatio} />}
+              {panel === "crop" && (
+                <CropOverlay imgBox={imgBox} value={crop} onChange={setCrop} ratio={cropNormRatio} />
+              )}
             </>
           )}
 
-          {/* floating zoom badge */}
-          <div style={zoomBadge}>{Math.round(view.zoom * 100)}%</div>
+          {/* Messages float over the stage rather than hiding in the panel,
+              which can be closed - an error there could go unseen entirely. */}
+          <div style={toastWrap}>
+            {error && (
+              <Toast tone="error" onClose={() => setError(null)}>
+                {error}
+              </Toast>
+            )}
+            {notice && (
+              <Toast tone="notice" onClose={() => setNotice(null)}>
+                {notice}
+              </Toast>
+            )}
+          </div>
 
           {/* floating AI prompt bar, below the image */}
-          {tool === "ai" && (
+          {panel === "ai" && (
             <div
               style={aiBar}
               // The stage captures the pointer on any pointerdown that reaches
@@ -653,68 +665,175 @@ export default function Editor() {
                   style={{ flex: 1, minHeight: 40, maxHeight: 120, background: "var(--panel-2)" }}
                   disabled={aiBusy}
                 />
-                <button className="primary" onClick={runAI} disabled={aiBusy || !aiPrompt.trim()} style={{ height: 40 }} title="Ctrl+Enter">
+                <button
+                  className="primary"
+                  onClick={runAI}
+                  disabled={aiBusy || !aiPrompt.trim()}
+                  style={{ height: 40 }}
+                  title="Ctrl+Enter"
+                >
                   {aiBusy ? "…" : "Generate"}
                 </button>
               </div>
-              <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginTop: 8 }}>
+              <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginTop: 8, alignItems: "center" }}>
                 {["Remove background", "Black & white film", "Enhance & sharpen", "Golden-hour light"].map((p) => (
-                  <button key={p} style={{ fontSize: 11, padding: "4px 8px" }} onClick={() => setAiPrompt(p)} disabled={aiBusy}>
+                  <button
+                    key={p}
+                    style={{ fontSize: 11, padding: "4px 8px" }}
+                    onClick={() => setAiPrompt(p)}
+                    disabled={aiBusy}
+                  >
                     {p}
                   </button>
                 ))}
-                <span style={{ ...hint, fontSize: 11, marginLeft: "auto", alignSelf: "center" }}>
-                  {lastUpload
-                    ? `Sent ${lastUpload}`
-                    : `Sends a copy at up to ${AI_MAX_EDGE[aiSize] ?? AI_MAX_EDGE[""]} px`}
+                <span style={{ ...hint, fontSize: 11, marginLeft: "auto" }}>
+                  {lastUpload ? `Sent ${lastUpload}` : `Sends a copy at up to ${AI_MAX_EDGE[aiSize] ?? AI_MAX_EDGE[""]} px`}
                 </span>
               </div>
             </div>
           )}
         </div>
-      </div>
 
-      {/* RIGHT SETTINGS (always visible) */}
-      <aside style={{ width: 300, background: "var(--panel)", borderLeft: "1px solid var(--border)", display: "flex", flexDirection: "column", overflowY: "auto" }}>
-        {error && <div style={{ ...errorBox, margin: 16 }}>{error}</div>}
-        {notice && (
-          <div style={{ ...noticeBox, margin: error ? "0 16px 16px" : 16 }}>
-            {notice}
-            <button onClick={() => setNotice(null)} style={dismissBtn} title="Dismiss">×</button>
-          </div>
-        )}
-
-        {tool === "crop" && (
-          <Section title="Crop">
-            <p style={hint}>Pick a ratio in the top bar, or drag freely. Pull handles past the edge to crop out. Press Enter to apply.</p>
-            <div style={{ display: "flex", gap: 8 }}>
-              <button style={{ flex: 1 }} onClick={() => { setCrop(FULL_CROP); chooseCropAspect(null); }}>Reset</button>
-              <button className="primary" style={{ flex: 1 }} onClick={applyCrop}>Apply crop</button>
-            </div>
-          </Section>
-        )}
-
-        {/* Tabbed settings — always available */}
-        <RightPanel
-          adjust={adjust}
-          setAdjust={setAdjust}
-          onCommit={() => void flatten()}
-          onTransform={applyTransform}
+        <StatusBar
           img={img}
           zoom={view.zoom}
           step={index}
           total={history.length}
-          models={models}
-          aiModel={aiModel}
-          setAiModel={setAiModel}
-          aiAspect={aiAspect}
-          setAiAspect={setAiAspect}
-          aiSize={aiSize}
-          setAiSize={setAiSize}
-          tab={panelTab}
-          setTab={setPanelTab}
+          canBack={index > 0}
+          canForward={index < history.length - 1}
+          onBack={stepBack}
+          onToggle={toggleLast}
+          onForward={stepForward}
         />
-      </aside>
+      </div>
+
+      {/* RIGHT: whatever the selected sidebar entry needs */}
+      {panel && (
+        <aside style={sidePanel}>
+          <div style={panelHeader}>
+            <span style={{ fontSize: 12, fontWeight: 700, textTransform: "uppercase", letterSpacing: 0.6 }}>
+              {panelTitle}
+            </span>
+            <button onClick={() => setPanel(null)} style={iconBtn} title="Close panel (Esc)">
+              ×
+            </button>
+          </div>
+
+          {panel === "crop" && (
+            <div style={panelBody}>
+              <span style={label}>Ratio</span>
+              <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 6 }}>
+                {CROP_RATIOS.map(([lbl, r]) => {
+                  const active = cropAspect === r || (r === null && cropAspect === null);
+                  return (
+                    <button
+                      key={lbl}
+                      onClick={() => chooseCropAspect(r)}
+                      style={{
+                        fontSize: 11,
+                        padding: "6px 4px",
+                        background: active ? "var(--accent)" : undefined,
+                        borderColor: active ? "var(--accent)" : undefined,
+                        color: active ? "#fff" : undefined,
+                      }}
+                    >
+                      {lbl}
+                    </button>
+                  );
+                })}
+              </div>
+              <p style={hint}>Drag the handles on the photo. Pull one past the edge to crop outwards - the extra area stays transparent.</p>
+              <div style={{ display: "flex", gap: 8 }}>
+                <button
+                  style={{ flex: 1 }}
+                  onClick={() => {
+                    setCrop(FULL_CROP);
+                    chooseCropAspect(null);
+                  }}
+                >
+                  Reset
+                </button>
+                <button className="primary" style={{ flex: 1 }} onClick={applyCrop} title="Enter">
+                  Apply crop
+                </button>
+              </div>
+            </div>
+          )}
+
+          {panel === "adjust" && (
+            <div style={panelBody}>
+              {SLIDERS.map(([key, lbl, min, max]) => (
+                <div key={key} style={{ display: "grid", gap: 4 }}>
+                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline" }}>
+                    <span style={label}>{lbl}</span>
+                    <button
+                      onClick={() => setAdjust({ ...adjust, [key]: NEUTRAL_ADJUSTMENTS[key] })}
+                      title="Reset this one"
+                      style={{
+                        ...valueBtn,
+                        color: adjust[key] === NEUTRAL_ADJUSTMENTS[key] ? "var(--muted)" : "var(--text)",
+                      }}
+                    >
+                      {adjust[key]}
+                    </button>
+                  </div>
+                  <input
+                    type="range"
+                    min={min}
+                    max={max}
+                    value={adjust[key]}
+                    onChange={(e) => setAdjust({ ...adjust, [key]: Number(e.target.value) })}
+                    onPointerUp={() => void flatten()}
+                    onKeyUp={() => void flatten()}
+                    onTouchEnd={() => void flatten()}
+                  />
+                </div>
+              ))}
+              <button onClick={() => setAdjust(NEUTRAL_ADJUSTMENTS)} disabled={!adjustDirty}>
+                Reset all
+              </button>
+              <p style={hint}>Adjustments apply when you let go of a slider. Ctrl+Z steps back.</p>
+            </div>
+          )}
+
+          {panel === "ai" && (
+            <div style={panelBody}>
+              <Field label="Model" hint="Your Google account's available image models.">
+                <Select
+                  value={aiModel}
+                  onChange={setAiModel}
+                  options={models.map((m) => ({ value: m, label: m }))}
+                  placeholder={models.length ? "Pick a model" : "Loading…"}
+                />
+              </Field>
+              <Field label="Aspect ratio">
+                <Select
+                  value={aiAspect}
+                  onChange={setAiAspect}
+                  options={[
+                    { value: "", label: "Match input" },
+                    ...["1:1", "3:2", "2:3", "4:3", "3:4", "16:9", "9:16", "21:9"].map((r) => ({ value: r, label: r })),
+                  ]}
+                />
+              </Field>
+              <Field
+                label="Resolution"
+                hint={`Also sets how large a copy is uploaded: up to ${AI_MAX_EDGE[aiSize] ?? AI_MAX_EDGE[""]} px on the long edge.`}
+              >
+                <Select
+                  value={aiSize}
+                  onChange={setAiSize}
+                  options={[
+                    { value: "", label: "Model default" },
+                    ...["1K", "2K", "4K"].map((s) => ({ value: s, label: s })),
+                  ]}
+                />
+              </Field>
+              <p style={hint}>Type the edit in the bar over the photo, then Ctrl+Enter.</p>
+            </div>
+          )}
+        </aside>
+      )}
 
       {/* hidden picker used by Open / Ctrl+O */}
       <input
@@ -767,286 +886,357 @@ export default function Editor() {
 
 /* =========================== sub-views =========================== */
 
-function ToolRail(props: {
-  tool: Tool;
-  setTool: (t: Tool) => void;
+const SLIDERS: [keyof Adjustments, string, number, number][] = [
+  ["brightness", "Brightness", 0, 200],
+  ["contrast", "Contrast", 0, 200],
+  ["saturation", "Saturation", 0, 200],
+  ["sepia", "Warmth", 0, 100],
+  ["grayscale", "Grayscale", 0, 100],
+];
+
+/**
+ * The single home for every control. An entry either runs an action, opens a
+ * popup next to itself, or opens its controls in the side panel - which kind it
+ * is, is visible before you click it: panel entries carry a chevron and light
+ * up while open, popup entries carry a caret.
+ */
+function Sidebar(props: {
+  panel: Panel;
+  onPanel: (p: Panel) => void;
+  transformOpen: boolean;
+  onTransformToggle: () => void;
+  onTransform: (rotate: number, flipH?: boolean, flipV?: boolean) => void;
+  onOpen: () => void;
+  onSave: () => void;
+  dirty: boolean;
   onZoomIn: () => void;
   onZoomOut: () => void;
   onFit: () => void;
   onFullscreen: () => void;
 }) {
-  const tools: [Tool, string, string][] = [
-    ["crop", "▢", "Crop  (C)"],
-    ["ai", "✨", "AI Edit  (A)"],
-  ];
+  // The sidebar scrolls, which clips anything drawn outside it, so the popup is
+  // positioned in the viewport from the entry's own box instead of beside it.
+  const transformRef = useRef<HTMLDivElement>(null);
+  const [popupAt, setPopupAt] = useState<{ left: number; top: number } | null>(null);
+  useEffect(() => {
+    if (!props.transformOpen) return setPopupAt(null);
+    const r = transformRef.current?.getBoundingClientRect();
+    if (r) setPopupAt({ left: r.right + 8, top: r.top - 6 });
+  }, [props.transformOpen]);
+
   return (
-    <div style={{ width: 56, background: "var(--panel)", borderRight: "1px solid var(--border)", display: "flex", flexDirection: "column", alignItems: "center", padding: "10px 0", gap: 6 }}>
-      {tools.map(([id, icon, title]) => (
-        <RailButton key={id} active={props.tool === id} title={title} onClick={() => props.setTool(id)}>
-          {icon}
-        </RailButton>
-      ))}
+    <nav style={sidebar}>
+      <div style={brand}>
+        Photo<span style={{ color: "var(--accent)" }}>AI</span>
+      </div>
+
+      <GroupLabel>File</GroupLabel>
+      <Entry icon="⤓" label="Open" keyHint="Ctrl+O" onClick={props.onOpen} />
+      <Entry icon="⤒" label="Save" keyHint="Ctrl+S" onClick={props.onSave} dot={props.dirty} />
+
+      <GroupLabel>Edit</GroupLabel>
+      <Entry
+        icon="▢"
+        label="Crop"
+        keyHint="C"
+        kind="panel"
+        active={props.panel === "crop"}
+        onClick={() => props.onPanel("crop")}
+      />
+      <div ref={transformRef}>
+        <Entry
+          icon="⟳"
+          label="Transform"
+          keyHint="T"
+          kind="popup"
+          active={props.transformOpen}
+          onClick={props.onTransformToggle}
+        />
+        {props.transformOpen && popupAt && (
+          <>
+            <div style={popupCatcher} onClick={props.onTransformToggle} />
+            <div style={{ ...popup, left: popupAt.left, top: popupAt.top }}>
+              <span style={{ ...label, color: "var(--muted)" }}>Rotate</span>
+              <div style={{ display: "flex", gap: 6 }}>
+                <button style={{ flex: 1 }} onClick={() => props.onTransform(90)}>⟳ 90°</button>
+                <button style={{ flex: 1 }} onClick={() => props.onTransform(-90)}>⟲ 90°</button>
+                <button style={{ flex: 1 }} onClick={() => props.onTransform(180)}>180°</button>
+              </div>
+              <span style={{ ...label, color: "var(--muted)", marginTop: 4 }}>Flip</span>
+              <div style={{ display: "flex", gap: 6 }}>
+                <button style={{ flex: 1 }} onClick={() => props.onTransform(0, true, false)}>⇋ Horizontal</button>
+                <button style={{ flex: 1 }} onClick={() => props.onTransform(0, false, true)}>⇅ Vertical</button>
+              </div>
+            </div>
+          </>
+        )}
+      </div>
+      <Entry
+        icon="◐"
+        label="Adjustments"
+        keyHint="I"
+        kind="panel"
+        active={props.panel === "adjust"}
+        onClick={() => props.onPanel("adjust")}
+      />
+      <Entry
+        icon="✨"
+        label="AI Edit"
+        keyHint="A"
+        kind="panel"
+        active={props.panel === "ai"}
+        onClick={() => props.onPanel("ai")}
+      />
+
+      <GroupLabel>View</GroupLabel>
+      <Entry icon="＋" label="Zoom in" onClick={props.onZoomIn} />
+      <Entry icon="－" label="Zoom out" onClick={props.onZoomOut} />
+      <Entry icon="⤢" label="Fit to window" keyHint="R" onClick={props.onFit} />
+      <Entry icon="⛶" label="Fullscreen" keyHint="F" onClick={props.onFullscreen} />
+
       <div style={{ flex: 1 }} />
-      <RailButton title="Zoom in  (scroll up)" onClick={props.onZoomIn}>＋</RailButton>
-      <RailButton title="Zoom out  (scroll down)" onClick={props.onZoomOut}>－</RailButton>
-      <RailButton title="Fit to window  (R)" onClick={props.onFit}>⤢</RailButton>
-      <RailButton title="Fullscreen  (F)" onClick={props.onFullscreen}>⛶</RailButton>
-    </div>
+      <p style={{ ...hint, fontSize: 11, padding: "0 14px 14px" }}>Drag to pan · scroll to zoom</p>
+    </nav>
   );
 }
 
-function RailButton({ active, title, onClick, children }: { active?: boolean; title: string; onClick: () => void; children: React.ReactNode }) {
+function GroupLabel({ children }: { children: React.ReactNode }) {
+  return <div style={groupLabel}>{children}</div>;
+}
+
+function Entry(props: {
+  icon: string;
+  label: string;
+  keyHint?: string;
+  kind?: "panel" | "popup";
+  active?: boolean;
+  dot?: boolean;
+  onClick: () => void;
+}) {
+  const { active } = props;
   return (
     <button
-      title={title}
-      onClick={onClick}
+      onClick={props.onClick}
+      title={props.keyHint ? `${props.label}  (${props.keyHint})` : props.label}
+      aria-pressed={props.kind ? !!active : undefined}
       style={{
-        width: 40,
-        height: 40,
-        padding: 0,
-        fontSize: 18,
-        borderRadius: 8,
-        background: active ? "var(--accent)" : "transparent",
-        border: active ? "1px solid var(--accent)" : "1px solid transparent",
-        color: active ? "#fff" : "var(--text)",
-        display: "flex",
-        alignItems: "center",
-        justifyContent: "center",
+        ...entry,
+        background: active ? "rgba(76,141,255,0.14)" : "transparent",
+        color: active ? "var(--text)" : "var(--muted)",
+        boxShadow: active ? "inset 2px 0 0 var(--accent)" : "none",
       }}
     >
-      {children}
+      <span style={{ width: 18, textAlign: "center", fontSize: 14, color: active ? "var(--accent)" : "inherit" }}>
+        {props.icon}
+      </span>
+      <span style={{ flex: 1, textAlign: "left" }}>
+        {props.label}
+        {props.dot && <span style={unsavedDot} title="Unsaved changes" />}
+      </span>
+      {props.kind === "popup" && <span style={entryMark}>▾</span>}
+      {props.kind === "panel" && <span style={entryMark}>{active ? "‹" : "›"}</span>}
+      {!props.kind && props.keyHint && <span style={kbd}>{props.keyHint}</span>}
     </button>
   );
 }
 
-function TopBar(props: {
-  onOpen: () => void;
-  onToggle: () => void;
-  onBack: () => void;
-  onForward: () => void;
-  canBack: boolean;
-  canForward: boolean;
-  onDownload: () => void;
-  step: number;
-  total: number;
-  cropMode: boolean;
-  cropAspect: number | null;
-  onCropAspect: (n: number | null) => void;
-}) {
-  return (
-    <header style={{ height: 52, display: "flex", alignItems: "center", gap: 10, padding: "0 16px", borderBottom: "1px solid var(--border)", background: "var(--panel)" }}>
-      <strong style={{ fontSize: 15, letterSpacing: 0.3 }}>Photo<span style={{ color: "var(--accent)" }}>AI</span></strong>
-      {props.cropMode && (
-        <div style={{ display: "flex", alignItems: "center", gap: 6, marginLeft: 10, paddingLeft: 12, borderLeft: "1px solid var(--border)", overflowX: "auto" }}>
-          <span style={{ fontSize: 11, color: "var(--muted)", whiteSpace: "nowrap" }}>Ratio</span>
-          {CROP_RATIOS.map(([lbl, r]) => {
-            const active = props.cropAspect === r || (r === null && props.cropAspect === null);
-            return (
-              <button
-                key={lbl}
-                onClick={() => props.onCropAspect(r)}
-                style={{
-                  fontSize: 11,
-                  padding: "4px 8px",
-                  whiteSpace: "nowrap",
-                  background: active ? "var(--accent)" : undefined,
-                  borderColor: active ? "var(--accent)" : undefined,
-                  color: active ? "#fff" : undefined,
-                }}
-              >
-                {lbl}
-              </button>
-            );
-          })}
-        </div>
-      )}
-      <div style={{ flex: 1 }} />
-      <span style={{ fontSize: 11, color: "var(--muted)" }}>step {props.step + 1}/{props.total}</span>
-      <button title="Open photo (Ctrl+O)" onClick={props.onOpen}>Open</button>
-      <button title="Toggle last change (Ctrl+Z)" onClick={props.onToggle} disabled={!props.canBack}>Toggle</button>
-      <button title="Step back (Ctrl+Shift+Z)" onClick={props.onBack} disabled={!props.canBack}>◀ Back</button>
-      <button title="Step forward (Ctrl+Y)" onClick={props.onForward} disabled={!props.canForward}>Fwd ▶</button>
-      <button className="primary" title="Save image (Ctrl+S)" onClick={props.onDownload}>Download</button>
-    </header>
-  );
+/**
+ * Reduce w:h to something a person reads as a ratio. An AI result is whatever
+ * size the model felt like, and its lowest terms are usually nonsense like
+ * 1195:896 - so anything that does not land near a familiar ratio is shown as
+ * a decimal instead.
+ */
+function ratioLabel(w: number, h: number): string {
+  if (!w || !h) return "-";
+  const r = w / h;
+  const common: [string, number][] = [
+    ["1:1", 1], ["3:2", 3 / 2], ["2:3", 2 / 3], ["4:3", 4 / 3], ["3:4", 3 / 4],
+    ["16:9", 16 / 9], ["9:16", 9 / 16], ["21:9", 21 / 9], ["5:4", 5 / 4], ["4:5", 4 / 5],
+  ];
+  for (const [name, value] of common) {
+    if (Math.abs(r - value) / value < 0.01) return name;
+  }
+  return `${r.toFixed(2)}:1`;
 }
 
-function Section({ title, children }: { title: string; children: React.ReactNode }) {
-  return (
-    <div style={{ padding: 16, borderBottom: "1px solid var(--border)", display: "grid", gap: 12 }}>
-      <span style={{ fontSize: 12, fontWeight: 700, textTransform: "uppercase", letterSpacing: 0.6, color: "var(--muted)" }}>{title}</span>
-      {children}
-    </div>
-  );
-}
-
-function RightPanel(props: {
-  adjust: Adjustments;
-  setAdjust: (a: Adjustments) => void;
-  onCommit: () => void; // bake current adjustments into history (auto-apply)
-  onTransform: (rotate: number, flipH?: boolean, flipV?: boolean) => void;
+/** Reference data and history, out of the way along the bottom of the stage. */
+function StatusBar(props: {
   img: HTMLImageElement | null;
   zoom: number;
   step: number;
   total: number;
-  models: string[];
-  aiModel: string;
-  setAiModel: (v: string) => void;
-  aiAspect: string;
-  setAiAspect: (v: string) => void;
-  aiSize: string;
-  setAiSize: (v: string) => void;
-  tab: PanelTab;
-  setTab: (t: PanelTab) => void;
+  canBack: boolean;
+  canForward: boolean;
+  onBack: () => void;
+  onToggle: () => void;
+  onForward: () => void;
 }) {
-  const { adjust, setAdjust, img } = props;
-  const pt = props.tab;
-  const setPt = props.setTab;
-  const tabs: [PanelTab, string][] = [
-    ["settings", "Image"],
-    ["transform", "Transform"],
-    ["ai", "AI Settings"],
-    ["info", "Information"],
-  ];
-  const sliders: [keyof Adjustments, string, number, number][] = [
-    ["brightness", "Brightness", 0, 200],
-    ["contrast", "Contrast", 0, 200],
-    ["saturation", "Saturation", 0, 200],
-    ["sepia", "Warmth", 0, 100],
-    ["grayscale", "Grayscale", 0, 100],
-  ];
-  // auto-apply: bake into history when a slider gesture ends
-  const commit = () => props.onCommit();
-
-  const w = img?.naturalWidth ?? 0;
-  const h = img?.naturalHeight ?? 0;
-  const gcd = (a: number, b: number): number => (b ? gcd(b, a % b) : a);
-  const g = w && h ? gcd(w, h) : 1;
-  const info: [string, string][] = [
-    ["Dimensions", w ? `${w} × ${h} px` : "-"],
-    ["Megapixels", w ? `${((w * h) / 1_000_000).toFixed(2)} MP` : "-"],
-    ["Aspect ratio", w ? `${w / g} : ${h / g}` : "-"],
-    ["Orientation", w ? (w > h ? "Landscape" : w < h ? "Portrait" : "Square") : "-"],
-    ["Zoom", `${Math.round(props.zoom * 100)}%`],
-    ["History step", `${props.step + 1} / ${props.total}`],
-  ];
+  const w = props.img?.naturalWidth ?? 0;
+  const h = props.img?.naturalHeight ?? 0;
 
   return (
-    <>
-      <div style={{ display: "flex", borderTop: "1px solid var(--border)", borderBottom: "1px solid var(--border)", position: "sticky", top: 0, background: "var(--panel)", zIndex: 1 }}>
-        {tabs.map(([id, lbl]) => (
-          <button
-            key={id}
-            onClick={() => setPt(id)}
-            style={{
-              flex: 1,
-              border: "none",
-              borderRadius: 0,
-              background: pt === id ? "var(--panel-2)" : "transparent",
-              color: pt === id ? "var(--text)" : "var(--muted)",
-              borderBottom: pt === id ? "2px solid var(--accent)" : "2px solid transparent",
-              padding: "11px 2px",
-              fontSize: 11,
-              fontWeight: pt === id ? 600 : 400,
-            }}
-          >
-            {lbl}
-          </button>
-        ))}
-      </div>
+    <div style={statusBar}>
+      <span>{w ? `${w} × ${h} px` : "-"}</span>
+      <Dot />
+      <span>{w ? `${((w * h) / 1_000_000).toFixed(2)} MP` : "-"}</span>
+      <Dot />
+      <span>{ratioLabel(w, h)}</span>
+      <Dot />
+      <span>{Math.round(props.zoom * 100)}%</span>
 
-      {pt === "settings" && (
-        <div style={{ padding: 16, display: "grid", gap: 14 }}>
-          {sliders.map(([key, lbl, min, max]) => (
-            <div key={key} style={{ display: "grid", gap: 4 }}>
-              <div style={{ display: "flex", justifyContent: "space-between" }}>
-                <span style={label}>{lbl}</span>
-                <span style={{ ...label, color: "var(--muted)" }}>{adjust[key]}</span>
+      <div style={{ flex: 1 }} />
+
+      <span style={{ marginRight: 4 }}>
+        step {props.step + 1}/{props.total}
+      </span>
+      <button style={statusBtn} onClick={props.onBack} disabled={!props.canBack} title="Step back (Ctrl+Shift+Z)">
+        ◀
+      </button>
+      <button style={statusBtn} onClick={props.onToggle} disabled={!props.canBack} title="Toggle last change (Ctrl+Z)">
+        Compare
+      </button>
+      <button style={statusBtn} onClick={props.onForward} disabled={!props.canForward} title="Step forward (Ctrl+Y)">
+        ▶
+      </button>
+    </div>
+  );
+}
+
+function Dot() {
+  return <span style={{ opacity: 0.35 }}>·</span>;
+}
+
+function Field({ label: lbl, hint: h, children }: { label: string; hint?: string; children: React.ReactNode }) {
+  return (
+    <div style={{ display: "grid", gap: 5 }}>
+      <span style={label}>{lbl}</span>
+      {children}
+      {h && <span style={{ ...hint, fontSize: 11 }}>{h}</span>}
+    </div>
+  );
+}
+
+function Toast({
+  tone,
+  onClose,
+  children,
+}: {
+  tone: "error" | "notice";
+  onClose: () => void;
+  children: React.ReactNode;
+}) {
+  return (
+    <div style={tone === "error" ? errorBox : noticeBox}>
+      <span style={{ flex: 1 }}>{children}</span>
+      <button onClick={onClose} style={{ ...iconBtn, color: "inherit" }} title="Dismiss">
+        ×
+      </button>
+    </div>
+  );
+}
+
+/**
+ * A native <select> renders as an opaque OS widget that ignores the rest of the
+ * page's styling, which is jarring in a dark editor. This is the same control
+ * with the app's own look, and the keyboard behaviour people expect from one.
+ */
+function Select({
+  value,
+  onChange,
+  options,
+  placeholder = "Select…",
+}: {
+  value: string;
+  onChange: (v: string) => void;
+  options: { value: string; label: string }[];
+  placeholder?: string;
+}) {
+  const [open, setOpen] = useState(false);
+  const [activeIdx, setActiveIdx] = useState(0);
+  const wrapRef = useRef<HTMLDivElement>(null);
+  const selected = options.find((o) => o.value === value);
+
+  useEffect(() => {
+    if (!open) return;
+    const onDown = (e: MouseEvent) => {
+      if (!wrapRef.current?.contains(e.target as Node)) setOpen(false);
+    };
+    document.addEventListener("mousedown", onDown);
+    return () => document.removeEventListener("mousedown", onDown);
+  }, [open]);
+
+  useEffect(() => {
+    if (open) setActiveIdx(Math.max(0, options.findIndex((o) => o.value === value)));
+  }, [open, options, value]);
+
+  const commit = (i: number) => {
+    const o = options[i];
+    if (o) onChange(o.value);
+    setOpen(false);
+  };
+
+  const onKeyDown = (e: React.KeyboardEvent) => {
+    if (e.key === "Escape") {
+      setOpen(false);
+    } else if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+      e.preventDefault();
+      if (!open) return setOpen(true);
+      setActiveIdx((i) => Math.min(options.length - 1, Math.max(0, i + (e.key === "ArrowDown" ? 1 : -1))));
+    } else if (e.key === "Enter" || e.key === " ") {
+      e.preventDefault();
+      open ? commit(activeIdx) : setOpen(true);
+    }
+  };
+
+  return (
+    <div ref={wrapRef} style={{ position: "relative" }} onKeyDown={onKeyDown}>
+      <button
+        type="button"
+        onClick={() => setOpen((v) => !v)}
+        role="combobox"
+        aria-expanded={open}
+        aria-haspopup="listbox"
+        style={{
+          ...selectBtn,
+          borderColor: open ? "var(--accent)" : "var(--border)",
+          color: selected ? "var(--text)" : "var(--muted)",
+        }}
+      >
+        <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+          {selected?.label ?? placeholder}
+        </span>
+        <span style={{ color: "var(--muted)", transform: open ? "rotate(180deg)" : "none", transition: "transform .12s" }}>
+          ▾
+        </span>
+      </button>
+
+      {open && (
+        <div role="listbox" style={selectMenu}>
+          {options.length === 0 && <div style={{ ...selectOption, color: "var(--muted)" }}>Nothing to pick</div>}
+          {options.map((o, i) => {
+            const isSel = o.value === value;
+            return (
+              <div
+                key={o.value}
+                role="option"
+                aria-selected={isSel}
+                onMouseEnter={() => setActiveIdx(i)}
+                onClick={() => commit(i)}
+                style={{
+                  ...selectOption,
+                  background: i === activeIdx ? "var(--panel-2)" : "transparent",
+                  color: isSel ? "var(--accent)" : "var(--text)",
+                  fontWeight: isSel ? 600 : 400,
+                }}
+              >
+                <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{o.label}</span>
+                {isSel && <span>✓</span>}
               </div>
-              <input
-                type="range"
-                min={min}
-                max={max}
-                value={adjust[key]}
-                onChange={(e) => setAdjust({ ...adjust, [key]: Number(e.target.value) })}
-                onPointerUp={commit}
-                onKeyUp={commit}
-                onTouchEnd={commit}
-              />
-            </div>
-          ))}
-          <p style={hint}>Adjustments apply automatically. Use Ctrl+Z to step back.</p>
+            );
+          })}
         </div>
       )}
-
-      {pt === "transform" && (
-        <div style={{ padding: 16, display: "grid", gap: 12 }}>
-          <span style={label}>Rotate</span>
-          <div style={{ display: "flex", gap: 6 }}>
-            <button style={{ flex: 1 }} onClick={() => props.onTransform(90)}>⟳ 90°</button>
-            <button style={{ flex: 1 }} onClick={() => props.onTransform(-90)}>⟲ 90°</button>
-            <button style={{ flex: 1 }} onClick={() => props.onTransform(180)}>180°</button>
-          </div>
-          <span style={label}>Flip</span>
-          <div style={{ display: "flex", gap: 6 }}>
-            <button style={{ flex: 1 }} onClick={() => props.onTransform(0, true, false)}>⇋ Horizontal</button>
-            <button style={{ flex: 1 }} onClick={() => props.onTransform(0, false, true)}>⇅ Vertical</button>
-          </div>
-          <p style={hint}>Each transform is applied immediately and added to history.</p>
-        </div>
-      )}
-
-      {pt === "ai" && (
-        <div style={{ padding: 16, display: "grid", gap: 14 }}>
-          <div style={{ display: "grid", gap: 4 }}>
-            <span style={label}>Model</span>
-            <select
-              value={props.aiModel}
-              onChange={(e) => props.setAiModel(e.target.value)}
-              style={selectStyle}
-            >
-              {props.models.length === 0 && <option value="">Loading…</option>}
-              {props.models.map((m) => (
-                <option key={m} value={m}>{m}</option>
-              ))}
-            </select>
-            <span style={{ ...hint, marginTop: 2 }}>Fetched from your Google account&apos;s available image models.</span>
-          </div>
-
-          <div style={{ display: "grid", gap: 4 }}>
-            <span style={label}>Aspect ratio</span>
-            <select value={props.aiAspect} onChange={(e) => props.setAiAspect(e.target.value)} style={selectStyle}>
-              <option value="">Match input</option>
-              {["1:1", "3:2", "2:3", "4:3", "3:4", "16:9", "9:16", "21:9"].map((r) => (
-                <option key={r} value={r}>{r}</option>
-              ))}
-            </select>
-          </div>
-
-          <div style={{ display: "grid", gap: 4 }}>
-            <span style={label}>Resolution</span>
-            <select value={props.aiSize} onChange={(e) => props.setAiSize(e.target.value)} style={selectStyle}>
-              <option value="">Model default</option>
-              {["1K", "2K", "4K"].map((s) => (
-                <option key={s} value={s}>{s}</option>
-              ))}
-            </select>
-            <span style={{ ...hint, marginTop: 2 }}>Aspect ratio &amp; resolution apply where the selected model supports them.</span>
-          </div>
-        </div>
-      )}
-
-      {pt === "info" && (
-        <div style={{ padding: 16, display: "grid", gap: 8 }}>
-          {info.map(([k, v]) => (
-            <div key={k} style={{ display: "flex", justifyContent: "space-between", fontSize: 12, padding: "6px 0", borderBottom: "1px solid var(--border)" }}>
-              <span style={{ color: "var(--muted)" }}>{k}</span>
-              <span style={{ fontWeight: 600 }}>{v}</span>
-            </div>
-          ))}
-        </div>
-      )}
-    </>
+    </div>
   );
 }
 
@@ -1054,7 +1244,13 @@ function Dropzone({ onFile, error }: { onFile: (f: File) => void; error: string 
   const fileRef = useRef<HTMLInputElement>(null);
   return (
     <div
-      style={{ height: "100vh", display: "flex", alignItems: "center", justifyContent: "center", background: "radial-gradient(circle at 50% 30%, #18181f, #0b0b0e)" }}
+      style={{
+        height: "100vh",
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "center",
+        background: "radial-gradient(circle at 50% 30%, #18181f, #0b0b0e)",
+      }}
       onDragOver={(e) => e.preventDefault()}
       onDrop={(e) => {
         e.preventDefault();
@@ -1062,12 +1258,33 @@ function Dropzone({ onFile, error }: { onFile: (f: File) => void; error: string 
         if (f) onFile(f);
       }}
     >
-      <div style={{ textAlign: "center", padding: 48, border: "2px dashed var(--border)", borderRadius: 16, background: "rgba(255,255,255,0.02)", maxWidth: 460 }}>
+      <div
+        style={{
+          textAlign: "center",
+          padding: 48,
+          border: "2px dashed var(--border)",
+          borderRadius: 16,
+          background: "rgba(255,255,255,0.02)",
+          maxWidth: 460,
+        }}
+      >
         <div style={{ fontSize: 40, marginBottom: 8 }}>🖼️</div>
-        <h1 style={{ margin: "0 0 6px", fontSize: 24 }}>Photo<span style={{ color: "var(--accent)" }}>AI</span></h1>
-        <p style={{ color: "var(--muted)", margin: "0 0 20px", fontSize: 13 }}>Drop a photo here to start. Crop, adjust, and edit with AI.</p>
-        <input ref={fileRef} type="file" accept="image/*" style={{ display: "none" }} onChange={(e) => e.target.files?.[0] && onFile(e.target.files[0])} />
-        <button className="primary" onClick={() => fileRef.current?.click()}>Choose a photo</button>
+        <h1 style={{ margin: "0 0 6px", fontSize: 24 }}>
+          Photo<span style={{ color: "var(--accent)" }}>AI</span>
+        </h1>
+        <p style={{ color: "var(--muted)", margin: "0 0 20px", fontSize: 13 }}>
+          Drop a photo here to start. Crop, adjust, and edit with AI.
+        </p>
+        <input
+          ref={fileRef}
+          type="file"
+          accept="image/*"
+          style={{ display: "none" }}
+          onChange={(e) => e.target.files?.[0] && onFile(e.target.files[0])}
+        />
+        <button className="primary" onClick={() => fileRef.current?.click()}>
+          Choose a photo
+        </button>
         {error && <div style={{ ...errorBox, marginTop: 20 }}>{error}</div>}
       </div>
     </div>
@@ -1077,14 +1294,181 @@ function Dropzone({ onFile, error }: { onFile: (f: File) => void; error: string 
 /* =========================== styles =========================== */
 const label: React.CSSProperties = { fontSize: 12, fontWeight: 600 };
 const hint: React.CSSProperties = { fontSize: 12, color: "var(--muted)", margin: 0, lineHeight: 1.5 };
-const selectStyle: React.CSSProperties = {
+
+const sidebar: React.CSSProperties = {
+  width: 194,
+  flexShrink: 0,
+  background: "var(--panel)",
+  borderRight: "1px solid var(--border)",
+  display: "flex",
+  flexDirection: "column",
+  padding: "0 0 0 0",
+  overflowY: "auto",
+};
+const brand: React.CSSProperties = {
+  fontSize: 16,
+  fontWeight: 700,
+  letterSpacing: 0.3,
+  padding: "16px 14px 14px",
+};
+const groupLabel: React.CSSProperties = {
+  fontSize: 10,
+  fontWeight: 700,
+  textTransform: "uppercase",
+  letterSpacing: 0.8,
+  color: "var(--muted)",
+  opacity: 0.7,
+  padding: "14px 14px 6px",
+};
+const entry: React.CSSProperties = {
+  display: "flex",
+  alignItems: "center",
+  gap: 10,
+  width: "100%",
+  border: "none",
+  borderRadius: 0,
+  padding: "8px 12px",
+  fontSize: 13,
+  textAlign: "left",
+};
+const entryMark: React.CSSProperties = { fontSize: 12, color: "var(--muted)", opacity: 0.8 };
+const kbd: React.CSSProperties = {
+  fontSize: 10,
+  color: "var(--muted)",
+  opacity: 0.75,
+  border: "1px solid var(--border)",
+  borderRadius: 4,
+  padding: "1px 4px",
+  whiteSpace: "nowrap",
+};
+const unsavedDot: React.CSSProperties = {
+  display: "inline-block",
+  width: 6,
+  height: 6,
+  borderRadius: "50%",
+  background: "var(--accent)",
+  marginLeft: 6,
+  verticalAlign: "middle",
+};
+const popupCatcher: React.CSSProperties = { position: "fixed", inset: 0, zIndex: 40 };
+const popup: React.CSSProperties = {
+  position: "fixed",
+  zIndex: 41,
+  width: 236,
+  display: "grid",
+  gap: 6,
+  background: "var(--panel-2)",
+  border: "1px solid var(--border)",
+  borderRadius: 12,
+  padding: 12,
+  boxShadow: "0 18px 50px rgba(0,0,0,0.6)",
+};
+
+const sidePanel: React.CSSProperties = {
+  width: 300,
+  flexShrink: 0,
+  background: "var(--panel)",
+  borderLeft: "1px solid var(--border)",
+  display: "flex",
+  flexDirection: "column",
+  overflowY: "auto",
+};
+const panelHeader: React.CSSProperties = {
+  display: "flex",
+  alignItems: "center",
+  justifyContent: "space-between",
+  padding: "14px 12px 14px 16px",
+  borderBottom: "1px solid var(--border)",
+  position: "sticky",
+  top: 0,
+  background: "var(--panel)",
+  zIndex: 1,
+};
+const panelBody: React.CSSProperties = { padding: 16, display: "grid", gap: 14 };
+const iconBtn: React.CSSProperties = {
+  width: 26,
+  height: 26,
+  padding: 0,
+  border: "none",
+  background: "transparent",
+  color: "var(--muted)",
+  fontSize: 16,
+  lineHeight: 1,
+};
+const valueBtn: React.CSSProperties = {
+  border: "none",
+  background: "transparent",
+  padding: "0 2px",
+  fontSize: 12,
+  fontWeight: 600,
+};
+
+const statusBar: React.CSSProperties = {
+  height: 34,
+  flexShrink: 0,
+  display: "flex",
+  alignItems: "center",
+  gap: 8,
+  padding: "0 12px",
+  borderTop: "1px solid var(--border)",
+  background: "var(--panel)",
+  fontSize: 11,
+  color: "var(--muted)",
+};
+const statusBtn: React.CSSProperties = {
+  padding: "3px 8px",
+  fontSize: 11,
+  borderRadius: 6,
+  background: "transparent",
+};
+
+const selectBtn: React.CSSProperties = {
+  display: "flex",
+  alignItems: "center",
+  justifyContent: "space-between",
+  gap: 8,
+  width: "100%",
   background: "var(--bg)",
-  color: "var(--text)",
   border: "1px solid var(--border)",
   borderRadius: 8,
   padding: "9px 10px",
   fontSize: 13,
-  width: "100%",
+  textAlign: "left",
+};
+const selectMenu: React.CSSProperties = {
+  position: "absolute",
+  top: "calc(100% + 4px)",
+  left: 0,
+  right: 0,
+  zIndex: 50,
+  maxHeight: 240,
+  overflowY: "auto",
+  background: "var(--panel-2)",
+  border: "1px solid var(--border)",
+  borderRadius: 8,
+  padding: 4,
+  boxShadow: "0 16px 40px rgba(0,0,0,0.6)",
+};
+const selectOption: React.CSSProperties = {
+  display: "flex",
+  alignItems: "center",
+  justifyContent: "space-between",
+  gap: 8,
+  padding: "7px 8px",
+  borderRadius: 6,
+  fontSize: 13,
+  cursor: "pointer",
+};
+
+const toastWrap: React.CSSProperties = {
+  position: "absolute",
+  top: 12,
+  left: "50%",
+  transform: "translateX(-50%)",
+  zIndex: 30,
+  display: "grid",
+  gap: 8,
+  width: "min(560px, calc(100% - 32px))",
 };
 const aiBar: React.CSSProperties = {
   position: "absolute",
@@ -1106,17 +1490,6 @@ const aiBusyOverlay: React.CSSProperties = {
   color: "var(--muted)",
   marginBottom: 10,
 };
-const zoomBadge: React.CSSProperties = {
-  position: "absolute",
-  left: 12,
-  bottom: 12,
-  background: "rgba(0,0,0,0.6)",
-  color: "#fff",
-  fontSize: 11,
-  padding: "4px 8px",
-  borderRadius: 6,
-  pointerEvents: "none",
-};
 const modalBackdrop: React.CSSProperties = {
   position: "fixed",
   inset: 0,
@@ -1135,34 +1508,29 @@ const modalCard: React.CSSProperties = {
   padding: 22,
   boxShadow: "0 20px 60px rgba(0,0,0,0.6)",
 };
-const noticeBox: React.CSSProperties = {
-  position: "relative",
-  background: "rgba(255,255,255,0.05)",
-  border: "1px solid var(--border)",
-  color: "var(--muted)",
-  padding: "8px 26px 8px 10px",
-  borderRadius: 8,
-  fontSize: 12,
-  lineHeight: 1.5,
-};
-const dismissBtn: React.CSSProperties = {
-  position: "absolute",
-  top: 2,
-  right: 2,
-  width: 22,
-  height: 22,
-  padding: 0,
-  border: "none",
-  background: "transparent",
-  color: "var(--muted)",
-  fontSize: 15,
-  lineHeight: 1,
-};
 const errorBox: React.CSSProperties = {
-  background: "rgba(255,92,92,0.12)",
+  display: "flex",
+  alignItems: "flex-start",
+  gap: 8,
+  background: "rgba(255,92,92,0.14)",
   border: "1px solid rgba(255,92,92,0.4)",
   color: "#ffb3b3",
-  padding: "8px 10px",
-  borderRadius: 8,
+  padding: "8px 6px 8px 12px",
+  borderRadius: 10,
   fontSize: 12,
+  lineHeight: 1.5,
+  backdropFilter: "blur(8px)",
+};
+const noticeBox: React.CSSProperties = {
+  display: "flex",
+  alignItems: "flex-start",
+  gap: 8,
+  background: "rgba(23,23,28,0.94)",
+  border: "1px solid var(--border)",
+  color: "var(--muted)",
+  padding: "8px 6px 8px 12px",
+  borderRadius: 10,
+  fontSize: 12,
+  lineHeight: 1.5,
+  backdropFilter: "blur(8px)",
 };
