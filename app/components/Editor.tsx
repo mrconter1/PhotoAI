@@ -82,9 +82,13 @@ export default function Editor() {
   // back JPEG or WebP, and the export should not lie about the extension.
   const typesRef = useRef(new Map<string, string>());
 
+  // What each history state was made by, so the history list can name the steps
+  // rather than just number them.
+  const labelsRef = useRef(new Map<string, string>());
+
   const [img, setImg] = useState<HTMLImageElement | null>(null);
   const [adjust, setAdjust] = useState<Adjustments>(NEUTRAL_ADJUSTMENTS);
-  const [panel, setPanel] = useState<Panel>("adjust");
+  const [panel, setPanel] = useState<Panel>(null);
   const [transformOpen, setTransformOpen] = useState(false);
   const [crop, setCrop] = useState<CropRect>(FULL_CROP);
   const [cropAspect, setCropAspect] = useState<number | null>(null); // pixel w/h; null = free
@@ -150,6 +154,8 @@ export default function Editor() {
 
   const stageRef = useRef<HTMLDivElement>(null);
   const [stageSize, setStageSize] = useState({ w: 0, h: 0 });
+  const stageSizeRef = useRef({ w: 0, h: 0 });
+  stageSizeRef.current = stageSize;
   const [view, setView] = useState<Viewport>({ zoom: 1, x: 0, y: 0 });
   const [panning, setPanning] = useState(false);
 
@@ -170,8 +176,28 @@ export default function Editor() {
       if (!f) return;
       // fit the new image into the remembered frame, centered on the same point
       const zoom = Math.min(f.w / el.naturalWidth, f.h / el.naturalHeight);
+      const w = el.naturalWidth * zoom;
+      const h = el.naturalHeight * zoom;
+      let x = f.cx - w / 2;
+      let y = f.cy - h / 2;
+
+      // A step that changes the photo's shape can put the remembered centre
+      // near or past the edge of the stage, and the photo then swaps in mostly
+      // off-screen - it reads as having vanished. Deliberate panning is left
+      // alone; only a swap that would hide the photo re-centres it.
+      const st = stageSizeRef.current;
+      if (st.w && st.h) {
+        const visible =
+          Math.max(0, Math.min(x + w, st.w) - Math.max(x, 0)) *
+          Math.max(0, Math.min(y + h, st.h) - Math.max(y, 0));
+        if (visible < 0.4 * Math.min(w * h, st.w * st.h)) {
+          x = (st.w - w) / 2;
+          y = (st.h - h) / 2;
+        }
+      }
+
       fromSwap.current = true; // this view change must NOT move the frame
-      setView({ zoom, x: f.cx - (el.naturalWidth * zoom) / 2, y: f.cy - (el.naturalHeight * zoom) / 2 });
+      setView({ zoom, x, y });
     });
     return () => {
       cancelled = true;
@@ -183,6 +209,7 @@ export default function Editor() {
   const fromSwap = useRef(false);
   useEffect(() => {
     if (!img) return;
+    if (pendingFit.current) return; // nothing worth remembering until it is fitted
     if (fromSwap.current) {
       fromSwap.current = false;
       return;
@@ -231,8 +258,9 @@ export default function Editor() {
   // Adds a state, drops any redo branch it replaces, and keeps the depth capped.
   // Every URL that falls out is revoked so the blob behind it is freed - without
   // this, editing a large photo grows the tab's memory until it dies.
-  const pushState = useCallback((url: string, mime = "image/png") => {
+  const pushState = useCallback((url: string, label: string, mime = "image/png") => {
     typesRef.current.set(url, mime);
+    labelsRef.current.set(url, label);
     const h = historyRef.current;
     const kept = [...h.slice(0, indexRef.current + 1), url];
     const dropped = h.slice(indexRef.current + 1); // redo branch this edit replaces
@@ -245,6 +273,7 @@ export default function Editor() {
       if (u === savedUrlRef.current) continue;
       revoke(u);
       typesRef.current.delete(u);
+      labelsRef.current.delete(u);
     }
 
     const next = over ? kept.slice(over) : kept;
@@ -263,6 +292,8 @@ export default function Editor() {
       const { url, img: el, scaledFrom } = await openImageFile(file);
       for (const u of historyRef.current) revoke(u); // release the previous photo
       typesRef.current.clear();
+      labelsRef.current.clear();
+      labelsRef.current.set(url, "Original");
       // A downscale on open re-encodes to PNG; otherwise it is the file itself.
       typesRef.current.set(url, scaledFrom ? "image/png" : file.type || "image/png");
       pendingFit.current = true; // fit the newly opened image
@@ -271,7 +302,10 @@ export default function Editor() {
       indexRef.current = 0;
       setHistory([url]);
       setIndex(0);
-      setImg(el);
+      // Deliberately NOT setImg(el) here. The effect on `current` owns loading,
+      // and doing it in both places raced: whichever finished second re-anchored
+      // the view from a frame recorded before the first fit, which pinned the
+      // photo to the top-left corner of the stage from then on.
       setAdjust(NEUTRAL_ADJUSTMENTS);
       setSavedUrl(url); // freshly opened = clean
       setPanel("adjust");
@@ -292,7 +326,7 @@ export default function Editor() {
     if (!dirty) return img;
     const baked = await bakeToUrl(img, { rotate: 0, flipH: false, flipV: false }, adjust, null);
     const el = await loadImage(baked);
-    pushState(baked);
+    pushState(baked, "Adjustments");
     return el;
   }, [img, adjust, pushState]);
 
@@ -300,7 +334,8 @@ export default function Editor() {
     async (rotate: number, flipH = false, flipV = false) => {
       if (!img) return;
       try {
-        pushState(await bakeToUrl(img, { rotate, flipH, flipV }, adjust, null));
+        const what = flipH ? "Flip horizontal" : flipV ? "Flip vertical" : `Rotate ${rotate}°`;
+        pushState(await bakeToUrl(img, { rotate, flipH, flipV }, adjust, null), what);
       } catch (e) {
         setError(e instanceof Error ? e.message : "Could not apply the transform.");
       }
@@ -311,7 +346,7 @@ export default function Editor() {
   const applyCrop = useCallback(async () => {
     if (!img) return;
     try {
-      pushState(await bakeToUrl(img, { rotate: 0, flipH: false, flipV: false }, adjust, crop));
+      pushState(await bakeToUrl(img, { rotate: 0, flipH: false, flipV: false }, adjust, crop), "Crop");
       setCrop(FULL_CROP);
       setPanel(null);
     } catch (e) {
@@ -354,9 +389,10 @@ export default function Editor() {
       );
       setLastUpload(`${width} × ${height} px · ${formatBytes(blob.size)}`);
 
+      const prompt = aiPrompt.trim();
       const form = new FormData();
       form.append("image", blob, "image.webp");
-      form.append("prompt", aiPrompt.trim());
+      form.append("prompt", prompt);
       if (aiModel) form.append("model", aiModel);
       if (aiAspect) form.append("aspectRatio", aiAspect);
       if (aiSize) form.append("imageSize", aiSize);
@@ -366,7 +402,7 @@ export default function Editor() {
 
       const out = await res.blob();
       if (out.size === 0) throw new Error("The model returned an empty image.");
-      pushState(URL.createObjectURL(out), out.type || "image/png");
+      pushState(URL.createObjectURL(out), `AI: ${prompt}`, out.type || "image/png");
       setAiPrompt(""); // clear on success; stay on the AI tool for the next edit
     } catch (e) {
       setError(e instanceof Error ? e.message : "AI request failed.");
@@ -415,14 +451,42 @@ export default function Editor() {
     }
   }, [index]);
 
+  // "Compare to" borrows the history index rather than drawing a second image,
+  // so what you see while comparing is exactly what stepping there would show.
+  // compareFrom remembers the seat you got up from.
+  const [compareFrom, setCompareFrom] = useState<number | null>(null);
+  const compareTo = useCallback(
+    (target: "original" | "previous") => {
+      setAdjust(NEUTRAL_ADJUSTMENTS);
+      if (compareFrom !== null) {
+        setIndex(compareFrom); // second click on either button puts you back
+        setCompareFrom(null);
+        return;
+      }
+      const to = target === "original" ? 0 : Math.max(0, indexRef.current - 1);
+      if (to === indexRef.current) return;
+      setCompareFrom(indexRef.current);
+      setIndex(to);
+    },
+    [compareFrom]
+  );
+  const endCompare = useCallback(() => {
+    setCompareFrom((from) => {
+      if (from !== null) setIndex(from);
+      return null;
+    });
+  }, []);
+
   // Ctrl+Shift+Z: walk backward through the full history, one step per press.
   const stepBack = useCallback(() => {
     setAdjust(NEUTRAL_ADJUSTMENTS);
+    setCompareFrom(null);
     togglePair.current = null;
     setIndex((i) => Math.max(0, i - 1));
   }, []);
   const stepForward = useCallback(() => {
     setAdjust(NEUTRAL_ADJUSTMENTS);
+    setCompareFrom(null);
     togglePair.current = null;
     setIndex((i) => Math.min(history.length - 1, i + 1));
   }, [history.length]);
@@ -553,11 +617,18 @@ export default function Editor() {
   const panelTitle = panel === "crop" ? "Crop" : panel === "adjust" ? "Adjustments" : "AI Edit";
   const adjustDirty = adjustmentsToFilter(adjust) !== adjustmentsToFilter(NEUTRAL_ADJUSTMENTS);
 
-  if (!current) return <Dropzone onFile={openFile} error={error} />;
-
   return (
     <div style={{ display: "flex", height: "100vh" }}>
       <Sidebar
+        hasImage={!!current}
+        history={history}
+        step={index}
+        onUndo={stepBack}
+        onRedo={stepForward}
+        canUndo={index > 0}
+        canRedo={index < history.length - 1}
+        onCompare={compareTo}
+        comparing={compareFrom !== null}
         panel={panel}
         onPanel={(p) => setPanel((cur) => (cur === p ? null : p))}
         transformOpen={transformOpen}
@@ -596,7 +667,26 @@ export default function Editor() {
             background: "repeating-conic-gradient(#141418 0% 25%, #101014 0% 50%) 50% / 24px 24px",
           }}
         >
-          {imgBox && (
+          {!current && (
+            <div style={emptyStage}>
+              <div style={{ fontSize: 34, marginBottom: 10 }}>🖼️</div>
+              <p style={{ margin: "0 0 4px", fontSize: 15, fontWeight: 600 }}>No photo open</p>
+              <p style={{ ...hint, margin: "0 0 18px" }}>
+                Drop one here, or pick <strong style={{ color: "var(--text)", fontWeight: 600 }}>Open</strong> in the
+                menu.
+              </p>
+              <button
+                className="primary"
+                onClick={triggerPicker}
+                onPointerDown={(e) => e.stopPropagation()}
+                style={{ pointerEvents: "auto" }}
+              >
+                Choose a photo
+              </button>
+            </div>
+          )}
+
+          {current && imgBox && (
             <>
               <img
                 src={current}
@@ -622,6 +712,13 @@ export default function Editor() {
           {/* Messages float over the stage rather than hiding in the panel,
               which can be closed - an error there could go unseen entirely. */}
           <div style={toastWrap}>
+            {compareFrom !== null && (
+              <button onClick={endCompare} style={compareBadge} title="Back to where you were">
+                Comparing · showing step {index + 1},{" "}
+                {(current && labelsRef.current.get(current)) || "an earlier step"} — click to return to step{" "}
+                {compareFrom + 1}
+              </button>
+            )}
             {error && (
               <Toast tone="error" onClose={() => setError(null)}>
                 {error}
@@ -694,21 +791,11 @@ export default function Editor() {
           )}
         </div>
 
-        <StatusBar
-          img={img}
-          zoom={view.zoom}
-          step={index}
-          total={history.length}
-          canBack={index > 0}
-          canForward={index < history.length - 1}
-          onBack={stepBack}
-          onToggle={toggleLast}
-          onForward={stepForward}
-        />
+        <StatusBar img={img} zoom={view.zoom} />
       </div>
 
       {/* RIGHT: whatever the selected sidebar entry needs */}
-      {panel && (
+      {current && panel && (
         <aside style={sidePanel}>
           <div style={panelHeader}>
             <span style={{ fontSize: 12, fontWeight: 700, textTransform: "uppercase", letterSpacing: 0.6 }}>
@@ -886,6 +973,77 @@ export default function Editor() {
 
 /* =========================== sub-views =========================== */
 
+// Unicode glyphs (⤓ ▢ ⟳ ⛶) come from whatever font happens to have them, so
+// they land at different weights, sizes and baselines next to each other. These
+// are one stroke weight on one grid, and they take the row's colour.
+const ICONS: Record<string, React.ReactNode> = {
+  open: <path d="M3 7a2 2 0 0 1 2-2h3.9a2 2 0 0 1 1.6.8L11.5 7H19a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z" />,
+  save: (
+    <>
+      <path d="M12 3v11" />
+      <path d="m7.5 9.5 4.5 4.5 4.5-4.5" />
+      <path d="M4 20h16" />
+    </>
+  ),
+  crop: (
+    <>
+      <path d="M6 2v14a2 2 0 0 0 2 2h14" />
+      <path d="M18 22V8a2 2 0 0 0-2-2H2" />
+    </>
+  ),
+  transform: (
+    <>
+      <path d="M21 12a9 9 0 1 1-2.6-6.4" />
+      <path d="M21 3v6h-6" />
+    </>
+  ),
+  adjust: (
+    <>
+      <path d="M21 5h-7M10 5H3M21 12h-9M8 12H3M21 19h-5M12 19H3" />
+      <path d="M14 3v4M8 10v4M16 17v4" />
+    </>
+  ),
+  ai: (
+    <>
+      <path d="M11 3.5 12.7 8l4.5 1.7-4.5 1.8L11 16l-1.7-4.5L4.8 9.7 9.3 8z" />
+      <path d="m18 14.5.8 2 2 .8-2 .8-.8 2-.8-2-2-.8 2-.8z" />
+    </>
+  ),
+  zoomIn: (
+    <>
+      <circle cx="11" cy="11" r="7" />
+      <path d="m20.5 20.5-4.2-4.2M8.2 11h5.6M11 8.2v5.6" />
+    </>
+  ),
+  zoomOut: (
+    <>
+      <circle cx="11" cy="11" r="7" />
+      <path d="m20.5 20.5-4.2-4.2M8.2 11h5.6" />
+    </>
+  ),
+  fit: <path d="M8 3H5a2 2 0 0 0-2 2v3M16 3h3a2 2 0 0 1 2 2v3M8 21H5a2 2 0 0 1-2-2v-3M16 21h3a2 2 0 0 0 2-2v-3" />,
+  fullscreen: <path d="M15 3h6v6M21 3l-7.5 7.5M9 21H3v-6M3 21l7.5-7.5" />,
+};
+
+function Icon({ name }: { name: string }) {
+  return (
+    <svg
+      width="16"
+      height="16"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="1.7"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden="true"
+      style={{ display: "block", flexShrink: 0 }}
+    >
+      {ICONS[name]}
+    </svg>
+  );
+}
+
 const SLIDERS: [keyof Adjustments, string, number, number][] = [
   ["brightness", "Brightness", 0, 200],
   ["contrast", "Contrast", 0, 200],
@@ -901,6 +1059,15 @@ const SLIDERS: [keyof Adjustments, string, number, number][] = [
  * up while open, popup entries carry a caret.
  */
 function Sidebar(props: {
+  hasImage: boolean;
+  history: string[];
+  step: number;
+  onUndo: () => void;
+  onRedo: () => void;
+  canUndo: boolean;
+  canRedo: boolean;
+  onCompare: (target: "original" | "previous") => void;
+  comparing: boolean;
   panel: Panel;
   onPanel: (p: Panel) => void;
   transformOpen: boolean;
@@ -931,13 +1098,21 @@ function Sidebar(props: {
       </div>
 
       <GroupLabel>File</GroupLabel>
-      <Entry icon="⤓" label="Open" keyHint="Ctrl+O" onClick={props.onOpen} />
-      <Entry icon="⤒" label="Save" keyHint="Ctrl+S" onClick={props.onSave} dot={props.dirty} />
+      <Entry icon="open" label="Open" keyHint="Ctrl+O" onClick={props.onOpen} />
+      <Entry
+        icon="save"
+        label="Save"
+        keyHint="Ctrl+S"
+        onClick={props.onSave}
+        dot={props.dirty}
+        disabled={!props.hasImage}
+      />
 
       <GroupLabel>Edit</GroupLabel>
       <Entry
-        icon="▢"
+        icon="crop"
         label="Crop"
+        disabled={!props.hasImage}
         keyHint="C"
         kind="panel"
         active={props.panel === "crop"}
@@ -945,8 +1120,9 @@ function Sidebar(props: {
       />
       <div ref={transformRef}>
         <Entry
-          icon="⟳"
+          icon="transform"
           label="Transform"
+          disabled={!props.hasImage}
           keyHint="T"
           kind="popup"
           active={props.transformOpen}
@@ -972,16 +1148,18 @@ function Sidebar(props: {
         )}
       </div>
       <Entry
-        icon="◐"
+        icon="adjust"
         label="Adjustments"
+        disabled={!props.hasImage}
         keyHint="I"
         kind="panel"
         active={props.panel === "adjust"}
         onClick={() => props.onPanel("adjust")}
       />
       <Entry
-        icon="✨"
+        icon="ai"
         label="AI Edit"
+        disabled={!props.hasImage}
         keyHint="A"
         kind="panel"
         active={props.panel === "ai"}
@@ -989,13 +1167,60 @@ function Sidebar(props: {
       />
 
       <GroupLabel>View</GroupLabel>
-      <Entry icon="＋" label="Zoom in" onClick={props.onZoomIn} />
-      <Entry icon="－" label="Zoom out" onClick={props.onZoomOut} />
-      <Entry icon="⤢" label="Fit to window" keyHint="R" onClick={props.onFit} />
-      <Entry icon="⛶" label="Fullscreen" keyHint="F" onClick={props.onFullscreen} />
+      <Entry icon="zoomIn" label="Zoom in" onClick={props.onZoomIn} disabled={!props.hasImage} />
+      <Entry icon="zoomOut" label="Zoom out" onClick={props.onZoomOut} disabled={!props.hasImage} />
+      <Entry icon="fit" label="Fit to window" keyHint="R" onClick={props.onFit} disabled={!props.hasImage} />
+      <Entry icon="fullscreen" label="Fullscreen" keyHint="F" onClick={props.onFullscreen} disabled={!props.hasImage} />
 
-      <div style={{ flex: 1 }} />
-      <p style={{ ...hint, fontSize: 11, padding: "0 14px 14px" }}>Drag to pan · scroll to zoom</p>
+      <p style={{ ...hint, fontSize: 11, padding: "14px 14px 0" }}>Drag to pan · scroll to zoom</p>
+
+      <div style={{ flex: 1, minHeight: 12 }} />
+
+      <div style={historyWrap}>
+        <div style={{ ...groupLabel, padding: "10px 14px 6px" }}>History</div>
+
+        <div style={stepRow}>
+          <button
+            onClick={props.onUndo}
+            disabled={!props.canUndo}
+            title="Back one step (Ctrl+Shift+Z)"
+            style={stepArrow}
+          >
+            ◀
+          </button>
+          <span style={stepCount}>
+            {props.history.length ? `${props.step + 1} / ${props.history.length}` : "-"}
+          </span>
+          <button
+            onClick={props.onRedo}
+            disabled={!props.canRedo}
+            title="Forward one step (Ctrl+Y)"
+            style={stepArrow}
+          >
+            ▶
+          </button>
+        </div>
+
+        <div style={{ ...groupLabel, padding: "10px 14px 6px", opacity: 0.6 }}>Compare to</div>
+        <div style={{ display: "flex", gap: 6, padding: "0 12px 12px" }}>
+          <button
+            onClick={() => props.onCompare("original")}
+            disabled={!props.canUndo && !props.comparing}
+            title="Hold the original up against where you are now"
+            style={{ ...miniBtn, ...(props.comparing ? comparingBtn : null) }}
+          >
+            Original
+          </button>
+          <button
+            onClick={() => props.onCompare("previous")}
+            disabled={!props.canUndo && !props.comparing}
+            title="Hold the previous step up against where you are now"
+            style={{ ...miniBtn, ...(props.comparing ? comparingBtn : null) }}
+          >
+            Last change
+          </button>
+        </div>
+      </div>
     </nav>
   );
 }
@@ -1011,12 +1236,14 @@ function Entry(props: {
   kind?: "panel" | "popup";
   active?: boolean;
   dot?: boolean;
+  disabled?: boolean;
   onClick: () => void;
 }) {
   const { active } = props;
   return (
     <button
       onClick={props.onClick}
+      disabled={props.disabled}
       title={props.keyHint ? `${props.label}  (${props.keyHint})` : props.label}
       aria-pressed={props.kind ? !!active : undefined}
       style={{
@@ -1026,16 +1253,15 @@ function Entry(props: {
         boxShadow: active ? "inset 2px 0 0 var(--accent)" : "none",
       }}
     >
-      <span style={{ width: 18, textAlign: "center", fontSize: 14, color: active ? "var(--accent)" : "inherit" }}>
-        {props.icon}
+      <span style={{ color: active ? "var(--accent)" : "inherit" }}>
+        <Icon name={props.icon} />
       </span>
       <span style={{ flex: 1, textAlign: "left" }}>
         {props.label}
         {props.dot && <span style={unsavedDot} title="Unsaved changes" />}
       </span>
       {props.kind === "popup" && <span style={entryMark}>▾</span>}
-      {props.kind === "panel" && <span style={entryMark}>{active ? "‹" : "›"}</span>}
-      {!props.kind && props.keyHint && <span style={kbd}>{props.keyHint}</span>}
+      {props.keyHint && <span style={kbd}>{props.keyHint}</span>}
     </button>
   );
 }
@@ -1060,17 +1286,7 @@ function ratioLabel(w: number, h: number): string {
 }
 
 /** Reference data and history, out of the way along the bottom of the stage. */
-function StatusBar(props: {
-  img: HTMLImageElement | null;
-  zoom: number;
-  step: number;
-  total: number;
-  canBack: boolean;
-  canForward: boolean;
-  onBack: () => void;
-  onToggle: () => void;
-  onForward: () => void;
-}) {
+function StatusBar(props: { img: HTMLImageElement | null; zoom: number }) {
   const w = props.img?.naturalWidth ?? 0;
   const h = props.img?.naturalHeight ?? 0;
 
@@ -1083,21 +1299,6 @@ function StatusBar(props: {
       <span>{ratioLabel(w, h)}</span>
       <Dot />
       <span>{Math.round(props.zoom * 100)}%</span>
-
-      <div style={{ flex: 1 }} />
-
-      <span style={{ marginRight: 4 }}>
-        step {props.step + 1}/{props.total}
-      </span>
-      <button style={statusBtn} onClick={props.onBack} disabled={!props.canBack} title="Step back (Ctrl+Shift+Z)">
-        ◀
-      </button>
-      <button style={statusBtn} onClick={props.onToggle} disabled={!props.canBack} title="Toggle last change (Ctrl+Z)">
-        Compare
-      </button>
-      <button style={statusBtn} onClick={props.onForward} disabled={!props.canForward} title="Step forward (Ctrl+Y)">
-        ▶
-      </button>
     </div>
   );
 }
@@ -1240,57 +1441,6 @@ function Select({
   );
 }
 
-function Dropzone({ onFile, error }: { onFile: (f: File) => void; error: string | null }) {
-  const fileRef = useRef<HTMLInputElement>(null);
-  return (
-    <div
-      style={{
-        height: "100vh",
-        display: "flex",
-        alignItems: "center",
-        justifyContent: "center",
-        background: "radial-gradient(circle at 50% 30%, #18181f, #0b0b0e)",
-      }}
-      onDragOver={(e) => e.preventDefault()}
-      onDrop={(e) => {
-        e.preventDefault();
-        const f = e.dataTransfer.files?.[0];
-        if (f) onFile(f);
-      }}
-    >
-      <div
-        style={{
-          textAlign: "center",
-          padding: 48,
-          border: "2px dashed var(--border)",
-          borderRadius: 16,
-          background: "rgba(255,255,255,0.02)",
-          maxWidth: 460,
-        }}
-      >
-        <div style={{ fontSize: 40, marginBottom: 8 }}>🖼️</div>
-        <h1 style={{ margin: "0 0 6px", fontSize: 24 }}>
-          Photo<span style={{ color: "var(--accent)" }}>AI</span>
-        </h1>
-        <p style={{ color: "var(--muted)", margin: "0 0 20px", fontSize: 13 }}>
-          Drop a photo here to start. Crop, adjust, and edit with AI.
-        </p>
-        <input
-          ref={fileRef}
-          type="file"
-          accept="image/*"
-          style={{ display: "none" }}
-          onChange={(e) => e.target.files?.[0] && onFile(e.target.files[0])}
-        />
-        <button className="primary" onClick={() => fileRef.current?.click()}>
-          Choose a photo
-        </button>
-        {error && <div style={{ ...errorBox, marginTop: 20 }}>{error}</div>}
-      </div>
-    </div>
-  );
-}
-
 /* =========================== styles =========================== */
 const label: React.CSSProperties = { fontSize: 12, fontWeight: 600 };
 const hint: React.CSSProperties = { fontSize: 12, color: "var(--muted)", margin: 0, lineHeight: 1.5 };
@@ -1302,8 +1452,54 @@ const sidebar: React.CSSProperties = {
   borderRight: "1px solid var(--border)",
   display: "flex",
   flexDirection: "column",
-  padding: "0 0 0 0",
-  overflowY: "auto",
+  overflow: "hidden", // the history list scrolls, not the whole sidebar
+};
+const emptyStage: React.CSSProperties = {
+  position: "absolute",
+  inset: 0,
+  display: "flex",
+  flexDirection: "column",
+  alignItems: "center",
+  justifyContent: "center",
+  textAlign: "center",
+  padding: 24,
+  pointerEvents: "none",
+};
+const historyWrap: React.CSSProperties = {
+  flexShrink: 0,
+  borderTop: "1px solid var(--border)",
+  background: "rgba(0,0,0,0.15)",
+};
+const stepRow: React.CSSProperties = {
+  display: "flex",
+  alignItems: "center",
+  gap: 6,
+  padding: "0 12px",
+};
+const stepArrow: React.CSSProperties = {
+  width: 34,
+  padding: "5px 0",
+  fontSize: 11,
+  borderRadius: 6,
+};
+const stepCount: React.CSSProperties = {
+  flex: 1,
+  textAlign: "center",
+  fontSize: 12,
+  fontWeight: 600,
+  fontVariantNumeric: "tabular-nums",
+};
+const miniBtn: React.CSSProperties = {
+  flex: 1,
+  padding: "5px 4px",
+  fontSize: 11,
+  borderRadius: 6,
+};
+const comparingBtn: React.CSSProperties = {
+  background: "var(--accent)",
+  borderColor: "var(--accent)",
+  color: "#fff",
+  fontWeight: 600,
 };
 const brand: React.CSSProperties = {
   fontSize: 16,
@@ -1415,12 +1611,6 @@ const statusBar: React.CSSProperties = {
   fontSize: 11,
   color: "var(--muted)",
 };
-const statusBtn: React.CSSProperties = {
-  padding: "3px 8px",
-  fontSize: 11,
-  borderRadius: 6,
-  background: "transparent",
-};
 
 const selectBtn: React.CSSProperties = {
   display: "flex",
@@ -1469,6 +1659,18 @@ const toastWrap: React.CSSProperties = {
   display: "grid",
   gap: 8,
   width: "min(560px, calc(100% - 32px))",
+};
+const compareBadge: React.CSSProperties = {
+  width: "100%",
+  background: "rgba(76,141,255,0.16)",
+  border: "1px solid rgba(76,141,255,0.5)",
+  color: "#cfe0ff",
+  padding: "7px 12px",
+  borderRadius: 10,
+  fontSize: 12,
+  lineHeight: 1.4,
+  textAlign: "center",
+  backdropFilter: "blur(8px)",
 };
 const aiBar: React.CSSProperties = {
   position: "absolute",
