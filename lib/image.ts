@@ -61,6 +61,34 @@ export const AI_MAX_EDGE: Record<string, number> = {
 // the route ever runs, so this leaves room for the multipart envelope on top.
 export const AI_MAX_UPLOAD_BYTES = 3.5 * 1024 * 1024;
 
+// What the empty space left by a crop-out is painted with before an image goes
+// to the model. Transparency is not a reliable signal - depending on how the
+// upload is decoded it arrives as black, as white, or flattened away entirely,
+// and the model then has nothing to aim at. A flat mid-grey band is
+// unambiguous, can be named in the prompt ("the flat grey area"), and almost
+// never occurs as a real photo's full border.
+export const EMPTY_FILL = "#808080";
+
+// Aspect ratios the image model accepts. Asking for the padded canvas's own
+// ratio is what stops an outpaint coming back re-framed at some other shape.
+export const AI_ASPECTS = ["1:1", "2:3", "3:2", "3:4", "4:3", "4:5", "5:4", "9:16", "16:9", "21:9"];
+
+/** The accepted aspect ratio closest to w x h, compared in log space. */
+export function nearestAspect(w: number, h: number): string {
+  const r = w / Math.max(1, h);
+  let best = AI_ASPECTS[0];
+  let bestDelta = Infinity;
+  for (const a of AI_ASPECTS) {
+    const [x, y] = a.split(":").map(Number);
+    const delta = Math.abs(Math.log(x / y / r));
+    if (delta < bestDelta) {
+      bestDelta = delta;
+      best = a;
+    }
+  }
+  return best;
+}
+
 /** Scale factor (<= 1) that brings w x h inside the canvas budget. */
 export function canvasFitScale(w: number, h: number): number {
   const byEdge = Math.min(1, MAX_CANVAS_EDGE / Math.max(w, h));
@@ -152,6 +180,105 @@ export async function openImageFile(
   return { url: smallUrl, img: await loadImage(smallUrl), scaledFrom: from };
 }
 
+// ---- crop geometry ---------------------------------------------------------
+
+// How far a crop may travel outside the photo. Three image-widths of margin is
+// far more than any outpaint can sensibly fill, and the cap keeps a runaway
+// drag from asking for a canvas the browser cannot allocate.
+const CROP_REACH = 3;
+const CROP_MIN = 0.03;
+
+/** Keep a crop rect inside sane bounds without stopping it leaving the photo. */
+export function clampCrop(r: CropRect): CropRect {
+  const w = Math.min(1 + 2 * CROP_REACH, Math.max(CROP_MIN, r.w));
+  const h = Math.min(1 + 2 * CROP_REACH, Math.max(CROP_MIN, r.h));
+  return {
+    x: Math.min(CROP_REACH, Math.max(-CROP_REACH, r.x)),
+    y: Math.min(CROP_REACH, Math.max(-CROP_REACH, r.y)),
+    w,
+    h,
+  };
+}
+
+/**
+ * Re-shape a crop rect to a ratio around its own centre.
+ * "in" shrinks a side to fit the ratio (a normal crop); "out" grows one instead,
+ * so the box reaches past the photo and the new area becomes empty canvas.
+ * ratio is in normalized units (see cropNormRatio in the editor).
+ */
+export function fitCropRatio(c: CropRect, ratio: number, mode: "in" | "out"): CropRect {
+  const cx = c.x + c.w / 2;
+  const cy = c.y + c.h / 2;
+  let w = c.w;
+  let h = c.h;
+  const wider = c.w / c.h > ratio;
+  if (mode === "in" ? wider : !wider) w = c.h * ratio;
+  else h = c.w / ratio;
+  return clampCrop({ x: cx - w / 2, y: cy - h / 2, w, h });
+}
+
+/** Grow (or with a negative factor, shrink) a crop rect about its centre. */
+export function scaleCrop(c: CropRect, factor: number): CropRect {
+  const w = c.w * (1 + factor);
+  const h = c.h * (1 + factor);
+  return clampCrop({ x: c.x + c.w / 2 - w / 2, y: c.y + c.h / 2 - h / 2, w, h });
+}
+
+// ---- empty (transparent) margins ------------------------------------------
+
+/** Transparent border widths as a fraction of the image, or null if there are none. */
+export type Margins = { left: number; top: number; right: number; bottom: number };
+
+/**
+ * Measure the fully transparent border a crop-out left behind.
+ * Read from a small nearest-neighbour copy: getImageData on a 24 MP photo means
+ * allocating ~100 MB to answer a question a 400 px thumbnail answers just as
+ * well, and the numbers only ever become prose in a prompt.
+ */
+export function emptyMargins(img: HTMLImageElement): Margins | null {
+  const edge = 400;
+  const scale = Math.min(1, edge / Math.max(img.naturalWidth, img.naturalHeight));
+  const w = Math.max(1, Math.round(img.naturalWidth * scale));
+  const h = Math.max(1, Math.round(img.naturalHeight * scale));
+  const canvas = document.createElement("canvas");
+  canvas.width = w;
+  canvas.height = h;
+  const ctx = canvas.getContext("2d", { willReadFrequently: true });
+  if (!ctx) return null;
+  ctx.imageSmoothingEnabled = false; // don't let resampling bleed alpha inwards
+  ctx.drawImage(img, 0, 0, w, h);
+
+  let data: Uint8ClampedArray;
+  try {
+    data = ctx.getImageData(0, 0, w, h).data;
+  } catch {
+    return null; // a tainted canvas is not worth an error here
+  }
+
+  const OPAQUE = 8;
+  const colEmpty = (x: number) => {
+    for (let y = 0; y < h; y++) if (data[(y * w + x) * 4 + 3] > OPAQUE) return false;
+    return true;
+  };
+  const rowEmpty = (y: number) => {
+    for (let x = 0; x < w; x++) if (data[(y * w + x) * 4 + 3] > OPAQUE) return false;
+    return true;
+  };
+
+  let left = 0;
+  while (left < w && colEmpty(left)) left++;
+  if (left === w) return null; // nothing opaque at all - there is no photo to extend
+  let right = 0;
+  while (right < w - left && colEmpty(w - 1 - right)) right++;
+  let top = 0;
+  while (top < h && rowEmpty(top)) top++;
+  let bottom = 0;
+  while (bottom < h - top && rowEmpty(h - 1 - bottom)) bottom++;
+
+  if (!left && !right && !top && !bottom) return null;
+  return { left: left / w, top: top / h, right: right / w, bottom: bottom / h };
+}
+
 /**
  * Bake transform + adjustments + crop into a new canvas.
  * crop is in normalized coordinates relative to the *transformed* image, and
@@ -221,7 +348,8 @@ export async function bakeToUrl(
 export async function encodeForUpload(
   img: HTMLImageElement,
   maxEdge = AI_MAX_EDGE[""],
-  maxBytes = AI_MAX_UPLOAD_BYTES
+  maxBytes = AI_MAX_UPLOAD_BYTES,
+  background?: string
 ): Promise<{ blob: Blob; width: number; height: number }> {
   const scale = Math.min(1, maxEdge / Math.max(img.naturalWidth, img.naturalHeight));
   const canvas = document.createElement("canvas");
@@ -229,6 +357,10 @@ export async function encodeForUpload(
   canvas.height = Math.max(1, Math.round(img.naturalHeight * scale));
   const ctx = canvas.getContext("2d")!;
   ctx.imageSmoothingQuality = "high";
+  if (background) {
+    ctx.fillStyle = background;
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+  }
   ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
 
   let blob = await canvasToBlob(canvas, "image/webp", 0.92);
@@ -265,6 +397,64 @@ export function download(url: string, filename: string) {
   document.body.appendChild(a);
   a.click();
   a.remove();
+}
+
+// ---- saving ----------------------------------------------------------------
+
+type SaveFilePicker = (opts: {
+  suggestedName?: string;
+  types?: { description?: string; accept: Record<string, string[]> }[];
+}) => Promise<{
+  name: string;
+  createWritable: () => Promise<{ write: (data: Blob) => Promise<void>; close: () => Promise<void> }>;
+}>;
+
+/** true when the browser can show a real Save As dialog (Chrome/Edge desktop). */
+export function canPickSaveLocation(): boolean {
+  return typeof window !== "undefined" && typeof (window as unknown as { showSaveFilePicker?: SaveFilePicker }).showSaveFilePicker === "function";
+}
+
+export type SaveResult = { method: "picker" | "download"; name: string } | null; // null = cancelled
+
+/**
+ * Write the image out, letting the user choose where whenever the browser
+ * allows it. A plain <a download> drops the file into whatever the browser
+ * calls Downloads without ever naming the place, which is how a saved photo
+ * goes missing; the picker puts the folder in front of the person saving.
+ * The caller still has to say what happened - see the notice in the editor.
+ */
+export async function saveImageAs(url: string, filename: string, mime: string): Promise<SaveResult> {
+  const picker = (window as unknown as { showSaveFilePicker?: SaveFilePicker }).showSaveFilePicker;
+  if (picker) {
+    let handle: Awaited<ReturnType<SaveFilePicker>>;
+    try {
+      // Opened before fetching the blob: the dialog needs the click's transient
+      // activation, and an await in between can outlive it.
+      const ext = filename.slice(filename.lastIndexOf("."));
+      handle = await picker({
+        suggestedName: filename,
+        types: [{ description: "Image", accept: { [mime]: [ext] } }],
+      });
+    } catch (e) {
+      if (e instanceof DOMException && e.name === "AbortError") return null; // user closed the dialog
+      handle = null as never; // picker unavailable in this context - fall through
+    }
+    if (handle) {
+      const blob = await (await fetch(url)).blob();
+      const writable = await handle.createWritable();
+      await writable.write(blob);
+      await writable.close();
+      return { method: "picker", name: handle.name || filename };
+    }
+  }
+  download(url, filename);
+  return { method: "download", name: filename };
+}
+
+/** "IMG_1234.jpg" -> "IMG_1234-edited.png" */
+export function exportName(source: string | null, ext: string): string {
+  const base = (source || "photo").replace(/\.[^.]+$/, "").trim() || "photo";
+  return `${base}-edited.${ext}`;
 }
 
 export function formatBytes(n: number): string {

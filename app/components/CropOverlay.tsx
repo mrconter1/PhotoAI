@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback } from "react";
-import type { CropRect } from "@/lib/image";
+import { clampCrop, type CropRect } from "@/lib/image";
 
 type Props = {
   // pixel rect of the displayed image within the stage (respects zoom/pan)
@@ -9,13 +9,14 @@ type Props = {
   value: CropRect;
   onChange: (r: CropRect) => void;
   ratio?: number | null; // locked w/h in normalized units; null/undefined = free
+  outSize: { w: number; h: number }; // what applying the crop would produce, in px
 };
 
 type Handle = "move" | "nw" | "ne" | "sw" | "se" | "n" | "s" | "e" | "w";
 
 const MIN = 0.03;
 
-export default function CropOverlay({ imgBox, value, onChange, ratio }: Props) {
+export default function CropOverlay({ imgBox, value, onChange, ratio, outSize }: Props) {
   // Drag handling via window listeners so the pointer can leave the image
   // (crop-out) and the empty stage keeps receiving pan/zoom events.
   const startDrag = useCallback(
@@ -64,7 +65,7 @@ export default function CropOverlay({ imgBox, value, onChange, ratio }: Props) {
           w = x2 - x;
           h = y2 - y;
         }
-        onChange({ x, y, w, h });
+        onChange(clampCrop({ x, y, w, h }));
       };
       const up = () => {
         window.removeEventListener("pointermove", move);
@@ -73,7 +74,7 @@ export default function CropOverlay({ imgBox, value, onChange, ratio }: Props) {
       window.addEventListener("pointermove", move);
       window.addEventListener("pointerup", up);
     },
-    [imgBox, value, onChange]
+    [imgBox, value, onChange, ratio]
   );
 
   const box = {
@@ -82,6 +83,11 @@ export default function CropOverlay({ imgBox, value, onChange, ratio }: Props) {
     width: value.w * imgBox.width,
     height: value.h * imgBox.height,
   };
+
+  // Does the box reach outside the photo? That is the crop-out case, and it is
+  // worth saying out loud - the added area is empty until something fills it.
+  const grows =
+    value.x < -0.001 || value.y < -0.001 || value.x + value.w > 1.001 || value.y + value.h > 1.001;
 
   const handle = (h: Handle, cursor: string, left: number, top: number): React.CSSProperties => ({
     position: "absolute",
@@ -113,6 +119,22 @@ export default function CropOverlay({ imgBox, value, onChange, ratio }: Props) {
   return (
     // root ignores pointer events so panning/zoom on empty stage still works
     <div style={{ position: "absolute", inset: 0, pointerEvents: "none" }}>
+      {/* Where the photo itself ends. Without it a crop-out is just a box over a
+          dark stage, and there is no telling how much empty space you added. */}
+      {grows && (
+        <div
+          style={{
+            position: "absolute",
+            left: imgBox.left,
+            top: imgBox.top,
+            width: imgBox.width,
+            height: imgBox.height,
+            outline: "1px dashed rgba(255,255,255,0.55)",
+            outlineOffset: -1,
+          }}
+        />
+      )}
+
       {/* dim everything outside the crop */}
       <div
         style={{
@@ -135,6 +157,28 @@ export default function CropOverlay({ imgBox, value, onChange, ratio }: Props) {
           <div key={"h" + i} style={{ position: "absolute", top: `${(i * 100) / 3}%`, left: 0, right: 0, height: 1, background: "rgba(255,255,255,0.35)" }} />
         ))}
       </div>
+
+      {/* live read-out of what Apply would produce, pinned under the box */}
+      <div
+        style={{
+          position: "absolute",
+          left: box.left + box.width / 2,
+          top: box.top + box.height + 10,
+          transform: "translateX(-50%)",
+          padding: "3px 8px",
+          borderRadius: 999,
+          fontSize: 11,
+          fontWeight: 600,
+          whiteSpace: "nowrap",
+          color: "#fff",
+          background: "rgba(0,0,0,0.72)",
+          border: "1px solid rgba(255,255,255,0.18)",
+          backdropFilter: "blur(6px)",
+        }}
+      >
+        {outSize.w} × {outSize.h} px{grows ? " · adds empty space" : ""}
+      </div>
+
       {edges.map(([h, cursor, l, t]) => (
         <div key={h} onPointerDown={startDrag(h)} style={handle(h, cursor, l, t)} />
       ))}

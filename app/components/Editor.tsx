@@ -5,15 +5,24 @@ import {
   AI_MAX_EDGE,
   Adjustments,
   CropRect,
+  EMPTY_FILL,
+  Margins,
   NEUTRAL_ADJUSTMENTS,
   adjustmentsToFilter,
   bakeToUrl,
-  download,
+  canPickSaveLocation,
+  clampCrop,
+  emptyMargins,
   encodeForUpload,
+  exportName,
+  fitCropRatio,
   formatBytes,
   loadImage,
+  nearestAspect,
   openImageFile,
   revoke,
+  saveImageAs,
+  scaleCrop,
 } from "@/lib/image";
 import CropOverlay from "./CropOverlay";
 
@@ -65,6 +74,40 @@ async function errorFromResponse(res: Response): Promise<string> {
   return `AI request failed (${res.status}).`;
 }
 
+/**
+ * The prompt behind "Fill empty space".
+ * Outpainting fails far more often from a vague instruction than from a weak
+ * model: the request has to say that the grey band is empty, roughly how wide
+ * it is on each side, and that the photo itself is not to be touched. The
+ * measured margins go in as words because that is the one channel the model
+ * cannot misread.
+ */
+function fillPrompt(margins: Margins | null, extra: string): string {
+  const sides = margins
+    ? ([
+        ["left", margins.left],
+        ["right", margins.right],
+        ["top", margins.top],
+        ["bottom", margins.bottom],
+      ] as [string, number][])
+        .filter(([, v]) => v > 0.005)
+        .map(([side, v]) => `${side} ${Math.round(v * 100)}%`)
+        .join(", ")
+    : "";
+
+  return [
+    "This is a photograph sitting on a larger canvas. The flat grey area around it is empty and has to be filled in.",
+    sides ? `The grey band covers ${sides} of the canvas.` : "",
+    "Outpaint it: continue the photograph outwards into the grey so the whole canvas becomes one seamless image.",
+    "Match the perspective, horizon, lighting, colour, depth of field and grain of the existing photo.",
+    "Leave everything inside the photo exactly as it is - do not restyle, move, rescale or re-render it, and do not add new subjects.",
+    "Return the complete canvas with no grey remaining.",
+    extra,
+  ]
+    .filter(Boolean)
+    .join(" ");
+}
+
 export default function Editor() {
   // history of baked PNG object URLs (blob:); index = current state
   const [history, setHistory] = useState<string[]>([]);
@@ -77,6 +120,9 @@ export default function Editor() {
   const indexRef = useRef(-1);
   historyRef.current = history;
   indexRef.current = index;
+  // Read by the drop handler, which must not be rebuilt on every history change.
+  const currentRef = useRef<string | null>(null);
+  currentRef.current = current;
 
   // What each history URL actually holds. Bakes are PNG, but a model may hand
   // back JPEG or WebP, and the export should not lie about the extension.
@@ -92,6 +138,11 @@ export default function Editor() {
   const [transformOpen, setTransformOpen] = useState(false);
   const [crop, setCrop] = useState<CropRect>(FULL_CROP);
   const [cropAspect, setCropAspect] = useState<number | null>(null); // pixel w/h; null = free
+  // Which way a ratio button works: trim the photo down to it, or grow past the
+  // photo's edge to reach it. Growing is what leaves space for the AI to fill.
+  const [cropMode, setCropMode] = useState<"in" | "out">("in");
+  // Transparent border on the current image, i.e. what a crop-out left behind.
+  const [emptyArea, setEmptyArea] = useState<Margins | null>(null);
 
   const [aiPrompt, setAiPrompt] = useState("");
   const [aiBusy, setAiBusy] = useState(false);
@@ -101,8 +152,17 @@ export default function Editor() {
   const [savedUrl, setSavedUrl] = useState<string | null>(null); // last opened/saved image
   const savedUrlRef = useRef<string | null>(null);
   savedUrlRef.current = savedUrl;
-  const [confirmOpen, setConfirmOpen] = useState(false); // unsaved-changes dialog
+  // A photo waiting on a yes: either the file picker should be opened, or this
+  // dropped file should replace what is on the stage.
+  const [pendingOpen, setPendingOpen] = useState<{ kind: "picker" } | { kind: "file"; file: File } | null>(null);
+  const [dragging, setDragging] = useState(false);
   const openInputRef = useRef<HTMLInputElement>(null);
+  const [sourceName, setSourceName] = useState<string | null>(null); // file the photo came from
+  const [lastSave, setLastSave] = useState<{ method: "picker" | "download"; name: string } | null>(null);
+  // Whether this browser can offer a real Save As dialog. Read once on the
+  // client: touching window during render would differ from the server pass.
+  const [canPick, setCanPick] = useState(false);
+  useEffect(() => setCanPick(canPickSaveLocation()), []);
 
   // AI settings
   const [models, setModels] = useState<string[]>([]);
@@ -171,6 +231,11 @@ export default function Editor() {
     loadImage(current).then((el) => {
       if (cancelled) return;
       setImg(el);
+      try {
+        setEmptyArea(emptyMargins(el));
+      } catch {
+        setEmptyArea(null);
+      }
       if (pendingFit.current) return; // a fresh open fits itself (see below)
       const f = frame.current;
       if (!f) return;
@@ -308,6 +373,8 @@ export default function Editor() {
       // photo to the top-left corner of the stage from then on.
       setAdjust(NEUTRAL_ADJUSTMENTS);
       setSavedUrl(url); // freshly opened = clean
+      setSourceName(file.name || null);
+      setLastSave(null);
       setPanel("adjust");
       if (scaledFrom) {
         setNotice(
@@ -345,10 +412,16 @@ export default function Editor() {
 
   const applyCrop = useCallback(async () => {
     if (!img) return;
+    const grew = crop.x < -0.001 || crop.y < -0.001 || crop.x + crop.w > 1.001 || crop.y + crop.h > 1.001;
     try {
-      pushState(await bakeToUrl(img, { rotate: 0, flipH: false, flipV: false }, adjust, crop), "Crop");
+      pushState(
+        await bakeToUrl(img, { rotate: 0, flipH: false, flipV: false }, adjust, crop),
+        grew ? "Crop out" : "Crop"
+      );
       setCrop(FULL_CROP);
-      setPanel(null);
+      // A crop-out leaves a hole on purpose; hand straight over to the tool that
+      // fills it rather than closing the panel and leaving the user to find it.
+      setPanel(grew ? "ai" : null);
     } catch (e) {
       setError(e instanceof Error ? e.message : "Could not apply the crop.");
     }
@@ -357,71 +430,134 @@ export default function Editor() {
   // Locked crop ratio expressed in normalized (w/h) units for the overlay.
   const cropNormRatio = cropAspect && img ? cropAspect * (img.naturalHeight / img.naturalWidth) : null;
   const chooseCropAspect = useCallback(
-    (px: number | null) => {
+    (px: number | null, mode = cropMode) => {
       setCropAspect(px);
       if (px && img) {
         const nr = px * (img.naturalHeight / img.naturalWidth);
-        setCrop((c) => {
-          const cx = c.x + c.w / 2;
-          const cy = c.y + c.h / 2;
-          const w = c.w;
-          const h = w / nr;
-          return { x: cx - w / 2, y: cy - h / 2, w, h };
-        });
+        setCrop((c) => fitCropRatio(c, nr, mode));
       }
     },
-    [img]
+    [img, cropMode]
   );
 
-  const runAI = useCallback(async () => {
-    if (!img || !aiPrompt.trim()) return;
-    setError(null);
-    setAiBusy(true);
-    try {
-      const flat = await flatten();
+  // Switching direction re-applies the locked ratio the other way round, so the
+  // toggle does something visible instead of only affecting the next click.
+  const chooseCropMode = useCallback(
+    (mode: "in" | "out") => {
+      setCropMode(mode);
+      if (cropAspect && img) {
+        const nr = cropAspect * (img.naturalHeight / img.naturalWidth);
+        setCrop((c) => fitCropRatio(c, nr, mode));
+      }
+    },
+    [cropAspect, img]
+  );
 
-      // The full-resolution photo never leaves the browser: it is downscaled to
-      // the model's working size and compressed first, which is what keeps a
-      // 60 MP upload from timing out (or being refused) on the way to Google.
-      const { blob, width, height } = await encodeForUpload(
-        flat,
-        AI_MAX_EDGE[aiSize] ?? AI_MAX_EDGE[""]
-      );
-      setLastUpload(`${width} × ${height} px · ${formatBytes(blob.size)}`);
+  // Grow the box past the photo by a fixed amount. Dragging a handle outwards
+  // works, but it needs somewhere to drag to; these always work.
+  const expandCrop = useCallback((factor: number) => setCrop((c) => scaleCrop(c, factor)), []);
 
-      const prompt = aiPrompt.trim();
-      const form = new FormData();
-      form.append("image", blob, "image.webp");
-      form.append("prompt", prompt);
-      if (aiModel) form.append("model", aiModel);
-      if (aiAspect) form.append("aspectRatio", aiAspect);
-      if (aiSize) form.append("imageSize", aiSize);
+  // Pixel size the current crop would produce, for the panel and the overlay badge.
+  const cropOut = useMemo(() => {
+    if (!img) return { w: 0, h: 0 };
+    return {
+      w: Math.max(1, Math.round(crop.w * img.naturalWidth)),
+      h: Math.max(1, Math.round(crop.h * img.naturalHeight)),
+    };
+  }, [img, crop]);
+  const cropGrows = crop.x < -0.001 || crop.y < -0.001 || crop.x + crop.w > 1.001 || crop.y + crop.h > 1.001;
 
-      const res = await fetch("/api/ai-edit", { method: "POST", body: form });
-      if (!res.ok) throw new Error(await errorFromResponse(res));
+  // Opening Crop pulls the view back so the photo sits in about half the stage.
+  // Fit-to-screen leaves 24 px of margin, and a handle dragged into that lands
+  // outside the stage, which clips it - crop-out was unreachable by dragging.
+  useEffect(() => {
+    if (panel !== "crop" || !img || !stageSize.w || !stageSize.h) return;
+    const room = Math.min(
+      (stageSize.w * 0.55) / img.naturalWidth,
+      (stageSize.h * 0.55) / img.naturalHeight
+    );
+    setView((v) =>
+      v.zoom <= room
+        ? v
+        : {
+            zoom: room,
+            x: (stageSize.w - img.naturalWidth * room) / 2,
+            y: (stageSize.h - img.naturalHeight * room) / 2,
+          }
+    );
+  }, [panel, img, stageSize.w, stageSize.h]);
 
-      const out = await res.blob();
-      if (out.size === 0) throw new Error("The model returned an empty image.");
-      pushState(URL.createObjectURL(out), `AI: ${prompt}`, out.type || "image/png");
-      setAiPrompt(""); // clear on success; stay on the AI tool for the next edit
-    } catch (e) {
-      setError(e instanceof Error ? e.message : "AI request failed.");
-    } finally {
-      setAiBusy(false);
-    }
-  }, [img, aiPrompt, aiModel, aiAspect, aiSize, flatten, pushState]);
+  const runAI = useCallback(
+    async (mode: "edit" | "fill" = "edit") => {
+      const extra = aiPrompt.trim();
+      if (!img || (mode === "edit" && !extra)) return;
+      setError(null);
+      setAiBusy(true);
+      try {
+        const flat = await flatten();
+        const margins = emptyMargins(flat);
 
-  const doDownload = useCallback(async () => {
+        // Empty space is painted flat grey on the way out. Alpha survives the
+        // WebP encode but not the trip through the model, and a region the model
+        // cannot see is a region it will not fill.
+        const { blob, width, height } = await encodeForUpload(
+          flat,
+          AI_MAX_EDGE[aiSize] ?? AI_MAX_EDGE[""],
+          undefined,
+          margins ? EMPTY_FILL : undefined
+        );
+        setLastUpload(`${width} × ${height} px · ${formatBytes(blob.size)}`);
+
+        const prompt = mode === "fill" ? fillPrompt(margins, extra) : extra;
+        // An outpaint must come back the same shape it went out as, or the model
+        // re-frames the canvas and the empty band is still there.
+        const aspect = mode === "fill" ? nearestAspect(width, height) : aiAspect;
+
+        const form = new FormData();
+        form.append("image", blob, "image.webp");
+        form.append("prompt", prompt);
+        if (aiModel) form.append("model", aiModel);
+        if (aspect) form.append("aspectRatio", aspect);
+        if (aiSize) form.append("imageSize", aiSize);
+
+        const res = await fetch("/api/ai-edit", { method: "POST", body: form });
+        if (!res.ok) throw new Error(await errorFromResponse(res));
+
+        const out = await res.blob();
+        if (out.size === 0) throw new Error("The model returned an empty image.");
+        const label = mode === "fill" ? "AI: fill empty space" : `AI: ${extra}`;
+        pushState(URL.createObjectURL(out), label, out.type || "image/png");
+        setAiPrompt(""); // clear on success; stay on the AI tool for the next edit
+      } catch (e) {
+        setError(e instanceof Error ? e.message : "AI request failed.");
+      } finally {
+        setAiBusy(false);
+      }
+    },
+    [img, aiPrompt, aiModel, aiAspect, aiSize, flatten, pushState]
+  );
+
+  const doDownload = useCallback(async (): Promise<boolean> => {
     try {
       const flat = await flatten();
       const mime = typesRef.current.get(flat.src) || "image/png";
       const ext = EXT[mime] || "png";
-      download(flat.src, `photoai-export.${ext}`);
+      const result = await saveImageAs(flat.src, exportName(sourceName, ext), mime);
+      if (!result) return false; // the user closed the Save dialog; nothing was written
+
+      setLastSave(result);
       setSavedUrl(flat.src); // saving marks the current image clean
+      setNotice(
+        result.method === "picker"
+          ? `Saved as ${result.name}, in the folder you picked.`
+          : `Saved as ${result.name} in this browser's Downloads folder (Ctrl+J opens it).`
+      );
+      return true;
     } catch (e) {
       setError(e instanceof Error ? e.message : "Could not export the image.");
+      return false;
     }
-  }, [flatten]);
+  }, [flatten, sourceName]);
 
   // Unsaved changes = current differs from the last opened/saved image,
   // or there are uncommitted live adjustments.
@@ -432,9 +568,57 @@ export default function Editor() {
 
   const triggerPicker = useCallback(() => openInputRef.current?.click(), []);
   const requestOpen = useCallback(() => {
-    if (dirty) setConfirmOpen(true);
+    if (dirty) setPendingOpen({ kind: "picker" });
     else triggerPicker();
   }, [dirty, triggerPicker]);
+
+  /**
+   * A file dropped on the window.
+   * Nothing open, nothing to lose - it just opens. With a photo already on the
+   * stage it always asks first: a drop is easy to make by accident, and the
+   * thing it would throw away is someone's work.
+   */
+  const requestOpenFile = useCallback(
+    (file: File) => {
+      if (!currentRef.current) void openFile(file);
+      else setPendingOpen({ kind: "file", file });
+    },
+    [openFile]
+  );
+
+  // Files dropped anywhere but the stage used to be handled by the browser,
+  // which navigates the tab to the image and takes every unsaved edit with it.
+  useEffect(() => {
+    const swallow = (e: DragEvent) => e.preventDefault();
+    window.addEventListener("dragover", swallow);
+    window.addEventListener("drop", swallow);
+    return () => {
+      window.removeEventListener("dragover", swallow);
+      window.removeEventListener("drop", swallow);
+    };
+  }, []);
+
+  // dragenter/dragleave fire for every child the pointer crosses, so the depth
+  // is counted rather than toggled - otherwise the hint flickers on the way in.
+  const dragDepth = useRef(0);
+  const hasFiles = (e: React.DragEvent) => Array.from(e.dataTransfer.types || []).includes("Files");
+  const onDragEnter = (e: React.DragEvent) => {
+    if (!hasFiles(e)) return;
+    dragDepth.current += 1;
+    setDragging(true);
+  };
+  const onDragLeave = (e: React.DragEvent) => {
+    if (!hasFiles(e)) return;
+    dragDepth.current = Math.max(0, dragDepth.current - 1);
+    if (!dragDepth.current) setDragging(false);
+  };
+  const onDrop = (e: React.DragEvent) => {
+    e.preventDefault();
+    dragDepth.current = 0;
+    setDragging(false);
+    const file = e.dataTransfer.files?.[0];
+    if (file) requestOpenFile(file);
+  };
 
   // Ctrl+Z: A/B toggle between the current state and the previous one
   // (repeated presses flip back and forth to compare the last change).
@@ -567,10 +751,14 @@ export default function Editor() {
         // single-key tool / panel shortcuts
         const k = e.key.toLowerCase();
         const handled =
-          ["c", "a", "v", "escape", "i", "t", "f", "r"].includes(k) ||
+          ["c", "a", "v", "escape", "i", "t", "f", "r", "arrowleft", "arrowright"].includes(k) ||
           (e.key === "Enter" && panelRef.current === "crop");
         if (handled) e.preventDefault(); // don't let the key type into a field it may focus
-        if (k === "c") setPanel((p) => (p === "crop" ? null : "crop"));
+        // ← / → walk the versions. The same step as the History arrows, so the
+        // counter in the sidebar is the readout for both.
+        if (k === "arrowleft") stepBack();
+        else if (k === "arrowright") stepForward();
+        else if (k === "c") setPanel((p) => (p === "crop" ? null : "crop"));
         else if (k === "a") setPanel((p) => (p === "ai" ? null : "ai"));
         else if (k === "i") setPanel((p) => (p === "adjust" ? null : "adjust"));
         else if (k === "t") setTransformOpen((v) => !v);
@@ -618,7 +806,13 @@ export default function Editor() {
   const adjustDirty = adjustmentsToFilter(adjust) !== adjustmentsToFilter(NEUTRAL_ADJUSTMENTS);
 
   return (
-    <div style={{ display: "flex", height: "100vh" }}>
+    <div
+      style={{ display: "flex", height: "100vh" }}
+      onDragEnter={onDragEnter}
+      onDragOver={(e) => e.preventDefault()}
+      onDragLeave={onDragLeave}
+      onDrop={onDrop}
+    >
       <Sidebar
         hasImage={!!current}
         history={history}
@@ -629,6 +823,7 @@ export default function Editor() {
         canRedo={index < history.length - 1}
         onCompare={compareTo}
         comparing={compareFrom !== null}
+        stepLabel={current ? labelsRef.current.get(current) ?? null : null}
         panel={panel}
         onPanel={(p) => setPanel((cur) => (cur === p ? null : p))}
         transformOpen={transformOpen}
@@ -640,6 +835,8 @@ export default function Editor() {
         onOpen={requestOpen}
         onSave={doDownload}
         dirty={dirty}
+        canPick={canPick}
+        lastSave={lastSave}
         onZoomIn={() => zoomButton(1.25)}
         onZoomOut={() => zoomButton(1 / 1.25)}
         onFit={() => fitToScreen()}
@@ -653,12 +850,6 @@ export default function Editor() {
           onPointerDown={onStagePointerDown}
           onPointerMove={onStagePointerMove}
           onPointerUp={onStagePointerUp}
-          onDragOver={(e) => e.preventDefault()}
-          onDrop={(e) => {
-            e.preventDefault();
-            const f = e.dataTransfer.files?.[0];
-            if (f) void openFile(f);
-          }}
           style={{
             position: "relative",
             flex: 1,
@@ -704,7 +895,13 @@ export default function Editor() {
                 }}
               />
               {panel === "crop" && (
-                <CropOverlay imgBox={imgBox} value={crop} onChange={setCrop} ratio={cropNormRatio} />
+                <CropOverlay
+                  imgBox={imgBox}
+                  value={crop}
+                  onChange={(r) => setCrop(clampCrop(r))}
+                  ratio={cropNormRatio}
+                  outSize={cropOut}
+                />
               )}
             </>
           )}
@@ -764,7 +961,7 @@ export default function Editor() {
                 />
                 <button
                   className="primary"
-                  onClick={runAI}
+                  onClick={() => void runAI()}
                   disabled={aiBusy || !aiPrompt.trim()}
                   style={{ height: 40 }}
                   title="Ctrl+Enter"
@@ -772,6 +969,23 @@ export default function Editor() {
                   {aiBusy ? "…" : "Generate"}
                 </button>
               </div>
+
+              {/* Only offered when there is actually empty space to fill, so the
+                  button is never a promise the image cannot keep. */}
+              {emptyArea && (
+                <button
+                  onClick={() => void runAI("fill")}
+                  disabled={aiBusy}
+                  style={fillButton}
+                  title="Extend the photo into the empty area left by a crop-out"
+                >
+                  ✨ Fill empty space
+                  <span style={{ opacity: 0.75, fontWeight: 400 }}>
+                    — extend the photo into the area the crop added
+                  </span>
+                </button>
+              )}
+
               <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginTop: 8, alignItems: "center" }}>
                 {["Remove background", "Black & white film", "Enhance & sharpen", "Golden-hour light"].map((p) => (
                   <button
@@ -808,34 +1022,94 @@ export default function Editor() {
 
           {panel === "crop" && (
             <div style={panelBody}>
-              <span style={label}>Ratio</span>
-              <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 6 }}>
-                {CROP_RATIOS.map(([lbl, r]) => {
-                  const active = cropAspect === r || (r === null && cropAspect === null);
-                  return (
+              <div style={{ display: "grid", gap: 5 }}>
+                <span style={label}>Direction</span>
+                <div style={{ display: "flex", gap: 6 }}>
+                  {(
+                    [
+                      ["in", "Crop in", "Trim the photo down"],
+                      ["out", "Crop out", "Add empty space around it"],
+                    ] as const
+                  ).map(([mode, lbl, tip]) => (
                     <button
-                      key={lbl}
-                      onClick={() => chooseCropAspect(r)}
+                      key={mode}
+                      title={tip}
+                      onClick={() => chooseCropMode(mode)}
                       style={{
-                        fontSize: 11,
-                        padding: "6px 4px",
-                        background: active ? "var(--accent)" : undefined,
-                        borderColor: active ? "var(--accent)" : undefined,
-                        color: active ? "#fff" : undefined,
+                        flex: 1,
+                        fontSize: 12,
+                        padding: "7px 4px",
+                        background: cropMode === mode ? "var(--accent)" : undefined,
+                        borderColor: cropMode === mode ? "var(--accent)" : undefined,
+                        color: cropMode === mode ? "#fff" : undefined,
                       }}
                     >
                       {lbl}
                     </button>
-                  );
-                })}
+                  ))}
+                </div>
               </div>
-              <p style={hint}>Drag the handles on the photo. Pull one past the edge to crop outwards - the extra area stays transparent.</p>
+
+              <div style={{ display: "grid", gap: 5 }}>
+                <span style={label}>Ratio</span>
+                <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 6 }}>
+                  {CROP_RATIOS.map(([lbl, r]) => {
+                    const active = cropAspect === r || (r === null && cropAspect === null);
+                    return (
+                      <button
+                        key={lbl}
+                        onClick={() => chooseCropAspect(r)}
+                        style={{
+                          fontSize: 11,
+                          padding: "6px 4px",
+                          background: active ? "var(--accent)" : undefined,
+                          borderColor: active ? "var(--accent)" : undefined,
+                          color: active ? "#fff" : undefined,
+                        }}
+                      >
+                        {lbl}
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+
+              <div style={{ display: "grid", gap: 5 }}>
+                <span style={label}>Add space all round</span>
+                <div style={{ display: "flex", gap: 6 }}>
+                  {[0.1, 0.25, 0.5].map((f) => (
+                    <button key={f} style={{ flex: 1, fontSize: 11, padding: "6px 4px" }} onClick={() => expandCrop(f)}>
+                      +{Math.round(f * 100)}%
+                    </button>
+                  ))}
+                  <button
+                    style={{ flex: 1, fontSize: 11, padding: "6px 4px" }}
+                    onClick={() => expandCrop(-0.2)}
+                    title="Pull the box back in"
+                  >
+                    −20%
+                  </button>
+                </div>
+              </div>
+
+              <div style={cropReadout}>
+                <span>Result</span>
+                <strong style={{ fontVariantNumeric: "tabular-nums" }}>
+                  {cropOut.w} × {cropOut.h} px
+                </strong>
+              </div>
+              <p style={hint}>
+                {cropGrows
+                  ? "The new area is empty. Apply the crop, then open AI Edit and use Fill empty space to paint it in."
+                  : "Drag the handles on the photo, or use the buttons above. Crop out adds empty space the AI can fill."}
+              </p>
+
               <div style={{ display: "flex", gap: 8 }}>
                 <button
                   style={{ flex: 1 }}
                   onClick={() => {
                     setCrop(FULL_CROP);
-                    chooseCropAspect(null);
+                    setCropAspect(null);
                   }}
                 >
                   Reset
@@ -917,6 +1191,12 @@ export default function Editor() {
                 />
               </Field>
               <p style={hint}>Type the edit in the bar over the photo, then Ctrl+Enter.</p>
+              {emptyArea && (
+                <p style={{ ...hint, color: "var(--text)" }}>
+                  This photo has empty space around it. Use <strong>Fill empty space</strong> in the bar over the
+                  photo to have the model extend the picture into it.
+                </p>
+              )}
             </div>
           )}
         </aside>
@@ -935,33 +1215,65 @@ export default function Editor() {
         }}
       />
 
-      {/* unsaved-changes confirmation */}
-      {confirmOpen && (
-        <div style={modalBackdrop} onClick={() => setConfirmOpen(false)}>
+      {/* drop hint, over everything while a file is being dragged in */}
+      {dragging && (
+        <div style={dropOverlay}>
+          <div style={dropCard}>
+            <div style={{ fontSize: 30, marginBottom: 8 }}>🖼️</div>
+            <div style={{ fontSize: 15, fontWeight: 600 }}>Drop the photo to open it</div>
+            <div style={{ ...hint, marginTop: 4 }}>
+              {current ? "You will be asked before it replaces the one you have open." : "It opens straight away."}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* confirmation before a new photo takes the stage */}
+      {pendingOpen && (
+        <div style={modalBackdrop} onClick={() => setPendingOpen(null)}>
           <div style={modalCard} onClick={(e) => e.stopPropagation()}>
-            <h2 style={{ margin: "0 0 6px", fontSize: 17 }}>Unsaved changes</h2>
+            <h2 style={{ margin: "0 0 6px", fontSize: 17 }}>
+              {pendingOpen.kind === "file" ? "Open this photo instead?" : "Unsaved changes"}
+            </h2>
             <p style={{ margin: "0 0 18px", fontSize: 13, color: "var(--muted)", lineHeight: 1.5 }}>
-              You have edits that haven&apos;t been saved. Opening a new photo will discard them.
+              {pendingOpen.kind === "file" && (
+                <>
+                  <strong style={{ color: "var(--text)" }}>{pendingOpen.file.name}</strong> would replace the photo you
+                  have open.{" "}
+                </>
+              )}
+              {dirty
+                ? "You have edits that haven't been saved yet, and they will be lost."
+                : "The current photo and its versions will be closed."}
             </p>
             <div style={{ display: "flex", gap: 8, justifyContent: "flex-end", flexWrap: "wrap" }}>
-              <button onClick={() => setConfirmOpen(false)}>Cancel</button>
-              <button
-                onClick={async () => {
-                  setConfirmOpen(false);
-                  await doDownload();
-                  triggerPicker();
-                }}
-              >
-                Save &amp; open
-              </button>
+              <button onClick={() => setPendingOpen(null)}>Cancel</button>
+              {dirty && (
+                <button
+                  onClick={async () => {
+                    // Only go on if the save actually happened - cancelling the
+                    // Save dialog used to throw the edits away anyway.
+                    const saved = await doDownload();
+                    if (!saved) return;
+                    const req = pendingOpen;
+                    setPendingOpen(null);
+                    if (req.kind === "file") void openFile(req.file);
+                    else triggerPicker();
+                  }}
+                >
+                  Save &amp; open
+                </button>
+              )}
               <button
                 className="primary"
                 onClick={() => {
-                  setConfirmOpen(false);
-                  triggerPicker();
+                  const req = pendingOpen;
+                  setPendingOpen(null);
+                  if (req.kind === "file") void openFile(req.file);
+                  else triggerPicker();
                 }}
               >
-                Discard &amp; open
+                {dirty ? "Discard & open" : "Open"}
               </button>
             </div>
           </div>
@@ -1068,6 +1380,7 @@ function Sidebar(props: {
   canRedo: boolean;
   onCompare: (target: "original" | "previous") => void;
   comparing: boolean;
+  stepLabel: string | null; // what made the version you are looking at
   panel: Panel;
   onPanel: (p: Panel) => void;
   transformOpen: boolean;
@@ -1076,6 +1389,8 @@ function Sidebar(props: {
   onOpen: () => void;
   onSave: () => void;
   dirty: boolean;
+  canPick: boolean;
+  lastSave: { method: "picker" | "download"; name: string } | null;
   onZoomIn: () => void;
   onZoomOut: () => void;
   onFit: () => void;
@@ -1101,12 +1416,26 @@ function Sidebar(props: {
       <Entry icon="open" label="Open" keyHint="Ctrl+O" onClick={props.onOpen} />
       <Entry
         icon="save"
-        label="Save"
+        label={props.canPick ? "Save as…" : "Save"}
         keyHint="Ctrl+S"
         onClick={props.onSave}
         dot={props.dirty}
         disabled={!props.hasImage}
       />
+      {/* Where the file goes, said before and after the fact - the commonest
+          way to lose an edited photo is never being told where it landed. */}
+      <div style={saveWhere}>
+        {props.lastSave ? (
+          <>
+            Last saved <strong style={{ color: "var(--text)", fontWeight: 600 }}>{props.lastSave.name}</strong>
+            {props.lastSave.method === "download" ? " to your Downloads folder" : " where you chose"}
+          </>
+        ) : props.canPick ? (
+          "Save asks you which folder to put it in."
+        ) : (
+          "Saves into this browser's Downloads folder."
+        )}
+      </div>
 
       <GroupLabel>Edit</GroupLabel>
       <Entry
@@ -1180,45 +1509,44 @@ function Sidebar(props: {
         <div style={{ ...groupLabel, padding: "10px 14px 6px" }}>History</div>
 
         <div style={stepRow}>
-          <button
-            onClick={props.onUndo}
-            disabled={!props.canUndo}
-            title="Back one step (Ctrl+Shift+Z)"
-            style={stepArrow}
-          >
-            ◀
-          </button>
+          <Tip tip={TIPS.back}>
+            <button onClick={props.onUndo} disabled={!props.canUndo} aria-label="Previous version" style={stepArrow}>
+              ◀
+            </button>
+          </Tip>
           <span style={stepCount}>
             {props.history.length ? `${props.step + 1} / ${props.history.length}` : "-"}
           </span>
-          <button
-            onClick={props.onRedo}
-            disabled={!props.canRedo}
-            title="Forward one step (Ctrl+Y)"
-            style={stepArrow}
-          >
-            ▶
-          </button>
+          <Tip tip={TIPS.forward}>
+            <button onClick={props.onRedo} disabled={!props.canRedo} aria-label="Next version" style={stepArrow}>
+              ▶
+            </button>
+          </Tip>
+        </div>
+        <div style={{ ...saveWhere, padding: "4px 14px 0", textAlign: "center" }}>
+          {props.stepLabel ? props.stepLabel : "Use ← and → to step through versions"}
         </div>
 
         <div style={{ ...groupLabel, padding: "10px 14px 6px", opacity: 0.6 }}>Compare to</div>
         <div style={{ display: "flex", gap: 6, padding: "0 12px 12px" }}>
-          <button
-            onClick={() => props.onCompare("original")}
-            disabled={!props.canUndo && !props.comparing}
-            title="Hold the original up against where you are now"
-            style={{ ...miniBtn, ...(props.comparing ? comparingBtn : null) }}
-          >
-            Original
-          </button>
-          <button
-            onClick={() => props.onCompare("previous")}
-            disabled={!props.canUndo && !props.comparing}
-            title="Hold the previous step up against where you are now"
-            style={{ ...miniBtn, ...(props.comparing ? comparingBtn : null) }}
-          >
-            Last change
-          </button>
+          <Tip tip={TIPS.original} grow>
+            <button
+              onClick={() => props.onCompare("original")}
+              disabled={!props.canUndo && !props.comparing}
+              style={{ ...miniBtn, width: "100%", ...(props.comparing ? comparingBtn : null) }}
+            >
+              Original
+            </button>
+          </Tip>
+          <Tip tip={TIPS.previous} grow>
+            <button
+              onClick={() => props.onCompare("previous")}
+              disabled={!props.canUndo && !props.comparing}
+              style={{ ...miniBtn, width: "100%", ...(props.comparing ? comparingBtn : null) }}
+            >
+              Last change
+            </button>
+          </Tip>
         </div>
       </div>
     </nav>
@@ -1227,6 +1555,125 @@ function Sidebar(props: {
 
 function GroupLabel({ children }: { children: React.ReactNode }) {
   return <div style={groupLabel}>{children}</div>;
+}
+
+/* --------------------------- tooltips --------------------------- */
+
+/**
+ * What every control in the menu says about itself. Each one answers the two
+ * questions a native title= attribute never does: what is this for, and what do
+ * I actually do with it. Kept as data next to the sidebar so a new entry
+ * without an explanation is obvious at a glance.
+ */
+type TipText = { title: string; body: string; keys?: string };
+
+const TIPS: Record<string, TipText> = {
+  open: {
+    title: "Open a photo",
+    body: "Pick a picture from this computer to work on. You can also drag a file straight onto the photo area.",
+    keys: "Ctrl+O",
+  },
+  save: {
+    title: "Save the photo",
+    body:
+      "Writes the picture exactly as it looks now. Your browser asks which folder to put it in, and the menu then shows the name it was saved under.",
+    keys: "Ctrl+S",
+  },
+  crop: {
+    title: "Crop",
+    body:
+      "Trim the photo down, or switch to Crop out to add empty space around it. Drag the corner handles, or use the ratio and +% buttons, then Apply crop.",
+    keys: "C",
+  },
+  transform: {
+    title: "Rotate and flip",
+    body: "Turn the photo in 90° steps or mirror it. Each click is applied straight away and can be stepped back with ←.",
+    keys: "T",
+  },
+  adjust: {
+    title: "Colour and light",
+    body:
+      "Brightness, contrast, saturation, warmth and grayscale. Drag a slider to preview; letting go of it saves that as a version.",
+    keys: "I",
+  },
+  ai: {
+    title: "AI edit",
+    body:
+      "Describe a change in plain words and the image model redraws the photo. Also where Fill empty space lives, for space a crop-out added.",
+    keys: "A",
+  },
+  zoomIn: { title: "Zoom in", body: "Look closer at the photo. Scrolling the wheel over it does the same, centred on the pointer." },
+  zoomOut: { title: "Zoom out", body: "Pull back from the photo. Useful before a crop-out, to leave room to drag the handles outwards." },
+  fit: { title: "Fit to window", body: "Puts the whole photo back on screen at a size that fits. Undoes any zooming and panning.", keys: "R" },
+  fullscreen: { title: "Fullscreen", body: "Gives the photo the whole screen, with the menu hidden. Press F or Esc to come back.", keys: "F" },
+  back: { title: "Previous version", body: "Steps one change back. The counter shows which version you are on, and the line under it what made it.", keys: "←" },
+  forward: { title: "Next version", body: "Steps forward again, towards the newest version.", keys: "→" },
+  original: {
+    title: "Compare with the original",
+    body: "Jumps to the photo as it was opened, so you can see how far you have come. Click again to return to where you were.",
+  },
+  previous: {
+    title: "Compare with the step before",
+    body: "Shows what the last change actually did. Click again to return to where you were.",
+  },
+};
+
+/**
+ * Hover help anchored beside whatever it wraps.
+ * Fixed rather than absolute because the sidebar scrolls and clips, top-aligned
+ * with the row (and bottom-aligned near the foot of the window) so the card
+ * never needs its own height measured before it can be placed.
+ */
+function Tip({ tip, grow, children }: { tip?: TipText; grow?: boolean; children: React.ReactNode }) {
+  const [at, setAt] = useState<{ left: number; top?: number; bottom?: number } | null>(null);
+  const wrap = useRef<HTMLDivElement>(null);
+  const timer = useRef<number | undefined>(undefined);
+
+  const open = useCallback(() => {
+    window.clearTimeout(timer.current);
+    timer.current = window.setTimeout(() => {
+      const r = wrap.current?.getBoundingClientRect();
+      if (!r) return;
+      const nearBottom = r.top > window.innerHeight - 190;
+      setAt({
+        left: r.right + 10,
+        ...(nearBottom ? { bottom: window.innerHeight - r.bottom - 6 } : { top: r.top - 6 }),
+      });
+    }, 260); // long enough that sweeping past the menu stays quiet
+  }, []);
+
+  const close = useCallback(() => {
+    window.clearTimeout(timer.current);
+    setAt(null);
+  }, []);
+
+  useEffect(() => () => window.clearTimeout(timer.current), []);
+
+  if (!tip) return <>{children}</>;
+
+  return (
+    <div
+      ref={wrap}
+      style={{ position: "relative", flex: grow ? 1 : undefined, minWidth: 0 }}
+      onPointerEnter={open}
+      onPointerLeave={close}
+      onPointerDown={close}
+      onFocusCapture={open}
+      onBlurCapture={close}
+    >
+      {children}
+      {at && (
+        <div className="tip" style={{ ...tipCard, left: at.left, top: at.top, bottom: at.bottom }} role="tooltip">
+          <div style={{ ...tipArrow, ...(at.bottom !== undefined ? { bottom: 16 } : { top: 16 }) }} />
+          <div style={{ display: "flex", alignItems: "baseline", gap: 8 }}>
+            <span style={{ fontSize: 12.5, fontWeight: 700, flex: 1 }}>{tip.title}</span>
+            {tip.keys && <span style={{ ...kbd, opacity: 1 }}>{tip.keys}</span>}
+          </div>
+          <p style={{ margin: "5px 0 0", fontSize: 11.5, lineHeight: 1.55, color: "var(--muted)" }}>{tip.body}</p>
+        </div>
+      )}
+    </div>
+  );
 }
 
 function Entry(props: {
@@ -1241,28 +1688,32 @@ function Entry(props: {
 }) {
   const { active } = props;
   return (
-    <button
-      onClick={props.onClick}
-      disabled={props.disabled}
-      title={props.keyHint ? `${props.label}  (${props.keyHint})` : props.label}
-      aria-pressed={props.kind ? !!active : undefined}
-      style={{
-        ...entry,
-        background: active ? "rgba(76,141,255,0.14)" : "transparent",
-        color: active ? "var(--text)" : "var(--muted)",
-        boxShadow: active ? "inset 2px 0 0 var(--accent)" : "none",
-      }}
-    >
-      <span style={{ color: active ? "var(--accent)" : "inherit" }}>
-        <Icon name={props.icon} />
-      </span>
-      <span style={{ flex: 1, textAlign: "left" }}>
-        {props.label}
-        {props.dot && <span style={unsavedDot} title="Unsaved changes" />}
-      </span>
-      {props.kind === "popup" && <span style={entryMark}>▾</span>}
-      {props.keyHint && <span style={kbd}>{props.keyHint}</span>}
-    </button>
+    // The tip is keyed off the icon name, which is also what identifies the
+    // entry - so an entry can never quietly end up with another one's help.
+    <Tip tip={TIPS[props.icon]}>
+      <button
+        onClick={props.onClick}
+        disabled={props.disabled}
+        aria-label={props.label}
+        aria-pressed={props.kind ? !!active : undefined}
+        style={{
+          ...entry,
+          background: active ? "rgba(76,141,255,0.14)" : "transparent",
+          color: active ? "var(--text)" : "var(--muted)",
+          boxShadow: active ? "inset 2px 0 0 var(--accent)" : "none",
+        }}
+      >
+        <span style={{ color: active ? "var(--accent)" : "inherit" }}>
+          <Icon name={props.icon} />
+        </span>
+        <span style={{ flex: 1, textAlign: "left" }}>
+          {props.label}
+          {props.dot && <span style={unsavedDot} aria-label="Unsaved changes" />}
+        </span>
+        {props.kind === "popup" && <span style={entryMark}>▾</span>}
+        {props.keyHint && <span style={kbd}>{props.keyHint}</span>}
+      </button>
+    </Tip>
   );
 }
 
@@ -1528,6 +1979,14 @@ const entry: React.CSSProperties = {
   textAlign: "left",
 };
 const entryMark: React.CSSProperties = { fontSize: 12, color: "var(--muted)", opacity: 0.8 };
+const saveWhere: React.CSSProperties = {
+  padding: "2px 14px 0",
+  fontSize: 10.5,
+  lineHeight: 1.45,
+  color: "var(--muted)",
+  opacity: 0.85,
+  wordBreak: "break-word",
+};
 const kbd: React.CSSProperties = {
   fontSize: 10,
   color: "var(--muted)",
@@ -1545,6 +2004,28 @@ const unsavedDot: React.CSSProperties = {
   background: "var(--accent)",
   marginLeft: 6,
   verticalAlign: "middle",
+};
+const tipCard: React.CSSProperties = {
+  position: "fixed",
+  zIndex: 200, // over the transform popup and the side panel both
+  width: 252,
+  padding: "10px 12px",
+  borderRadius: 10,
+  background: "rgba(30,30,37,0.97)",
+  border: "1px solid var(--border)",
+  boxShadow: "0 16px 44px rgba(0,0,0,0.6)",
+  backdropFilter: "blur(8px)",
+  pointerEvents: "none", // never let the help get in the way of the control
+};
+const tipArrow: React.CSSProperties = {
+  position: "absolute",
+  left: -5,
+  width: 9,
+  height: 9,
+  transform: "rotate(45deg)",
+  background: "rgba(30,30,37,0.97)",
+  borderLeft: "1px solid var(--border)",
+  borderBottom: "1px solid var(--border)",
 };
 const popupCatcher: React.CSSProperties = { position: "fixed", inset: 0, zIndex: 40 };
 const popup: React.CSSProperties = {
@@ -1685,12 +2166,58 @@ const aiBar: React.CSSProperties = {
   padding: 12,
   boxShadow: "0 12px 40px rgba(0,0,0,0.55)",
 };
+const cropReadout: React.CSSProperties = {
+  display: "flex",
+  alignItems: "center",
+  justifyContent: "space-between",
+  gap: 8,
+  padding: "8px 10px",
+  borderRadius: 8,
+  background: "var(--panel-2)",
+  border: "1px solid var(--border)",
+  fontSize: 12,
+  color: "var(--muted)",
+};
+const fillButton: React.CSSProperties = {
+  display: "flex",
+  alignItems: "center",
+  gap: 6,
+  width: "100%",
+  marginTop: 8,
+  padding: "8px 10px",
+  fontSize: 12,
+  fontWeight: 600,
+  textAlign: "left",
+  background: "rgba(76,141,255,0.14)",
+  border: "1px solid rgba(76,141,255,0.5)",
+  color: "#cfe0ff",
+  borderRadius: 9,
+};
 const aiBusyOverlay: React.CSSProperties = {
   display: "flex",
   alignItems: "center",
   gap: 10,
   color: "var(--muted)",
   marginBottom: 10,
+};
+const dropOverlay: React.CSSProperties = {
+  position: "fixed",
+  inset: 0,
+  zIndex: 150,
+  display: "flex",
+  alignItems: "center",
+  justifyContent: "center",
+  background: "rgba(14,14,17,0.72)",
+  backdropFilter: "blur(2px)",
+  pointerEvents: "none", // the drop still has to reach the page underneath
+};
+const dropCard: React.CSSProperties = {
+  textAlign: "center",
+  padding: "26px 34px",
+  borderRadius: 16,
+  border: "2px dashed var(--accent)",
+  background: "rgba(30,30,37,0.9)",
+  boxShadow: "0 24px 70px rgba(0,0,0,0.6)",
 };
 const modalBackdrop: React.CSSProperties = {
   position: "fixed",

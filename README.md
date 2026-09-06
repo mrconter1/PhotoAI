@@ -6,13 +6,22 @@ generative edits and compare before/after.
 
 ## Features
 
-- **Open** via drag-and-drop or file picker
+- **Open** by dropping a file anywhere in the window, or via the file picker. A
+  drop onto an empty stage opens straight away; with a photo already open it
+  asks first, naming the file it would replace.
 - **Adjust** — brightness, contrast, saturation, warmth, grayscale, blur (live CSS-filter preview, baked on apply)
 - **Transform** — rotate 90°, flip horizontal/vertical
-- **Crop** — interactive rule-of-thirds crop with corner handles
+- **Crop in or out** — rule-of-thirds crop with corner handles, ratio presets,
+  and +10/25/50% buttons that grow the canvas past the photo. The added area is
+  empty, and is what the AI fills.
 - **AI Edit** — describe a change; the photo is sent to Google's image model and returned as a new layer
-- **Compare** — before/after slider
-- **Undo/redo** history (Ctrl+Z / Ctrl+Y) and PNG export
+- **Fill empty space** — one-click outpaint of the area a crop-out added. The
+  empty band is painted flat grey for the upload and described to the model by
+  side and width, and the request asks for the padded canvas's own aspect ratio.
+- **Compare** — hold the original or the previous step up against where you are
+- **Versions** — ← / → step through every state (also Ctrl+Z / Ctrl+Y)
+- **Save** — a real Save As dialog where the browser supports one, so the folder
+  is chosen rather than guessed; otherwise Downloads, and the app says so
 
 ## Architecture
 
