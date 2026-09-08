@@ -15,11 +15,14 @@ generative edits and compare before/after.
   and +10/25/50% buttons that grow the canvas past the photo. The added area is
   empty, and is what the AI fills.
 - **AI Edit** — describe a change; the photo is sent to Google's image model and returned as a new layer
+- **Versions** — ask for 1 to 4 results per run. One is applied straight away;
+  several are held out of the history until you pick, with a thumbnail strip of
+  the original plus each result (← / → to step, Enter to keep, Esc to discard)
 - **Fill empty space** — one-click outpaint of the area a crop-out added. The
   empty band is painted flat grey for the upload and described to the model by
   side and width, and the request asks for the padded canvas's own aspect ratio.
 - **Compare** — hold the original or the previous step up against where you are
-- **Versions** — ← / → step through every state (also Ctrl+Z / Ctrl+Y)
+- **History** — ← / → step through every state (also Ctrl+Z / Ctrl+Y)
 - **Save** — a real Save As dialog where the browser supports one, so the folder
   is chosen rather than guessed; otherwise Downloads, and the app says so
 

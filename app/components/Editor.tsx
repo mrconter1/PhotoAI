@@ -35,6 +35,9 @@ const FULL_CROP: CropRect = { x: 0, y: 0, w: 1, h: 1 };
 // Each history entry is a full-resolution PNG blob, so the depth is bounded:
 // 40 steps on a 24 MP photo is already north of a gigabyte of blob storage.
 const MAX_HISTORY = 40;
+// Versions one Generate may ask for. Four is where the thumbnail strip still
+// reads at a glance, and it is four times the cost of one - a cap, not a target.
+const MAX_VERSIONS = 4;
 const EXT: Record<string, string> = {
   "image/png": "png",
   "image/jpeg": "jpg",
@@ -169,6 +172,14 @@ export default function Editor() {
   const [aiModel, setAiModel] = useState("");
   const [aiAspect, setAiAspect] = useState(""); // "" = match input
   const [aiSize, setAiSize] = useState(""); // "" = model default
+  const [aiCount, setAiCount] = useState(1); // versions per run, 1..MAX_VERSIONS
+
+  // Results waiting to be judged. More than one and nothing is committed until
+  // the person picks; a single result goes straight into the history as before.
+  const [candidates, setCandidates] = useState<{ url: string; mime: string }[] | null>(null);
+  const [pick, setPick] = useState(0); // 0 = the photo you started from, 1..n = a result
+  const candidateLabel = useRef("");
+  const choosing = candidates !== null;
   const aiInputRef = useRef<HTMLTextAreaElement>(null);
   const hydrated = useRef(false);
 
@@ -181,6 +192,7 @@ export default function Editor() {
         if (typeof s.model === "string") setAiModel(s.model);
         if (typeof s.aspect === "string") setAiAspect(s.aspect);
         if (typeof s.size === "string") setAiSize(s.size);
+        if (Number.isInteger(s.count)) setAiCount(Math.min(MAX_VERSIONS, Math.max(1, s.count)));
       }
     } catch {}
     hydrated.current = true;
@@ -190,9 +202,12 @@ export default function Editor() {
   useEffect(() => {
     if (!hydrated.current) return;
     try {
-      localStorage.setItem("photoai:ai", JSON.stringify({ model: aiModel, aspect: aiAspect, size: aiSize }));
+      localStorage.setItem(
+        "photoai:ai",
+        JSON.stringify({ model: aiModel, aspect: aiAspect, size: aiSize, count: aiCount })
+      );
     } catch {}
-  }, [aiModel, aiAspect, aiSize]);
+  }, [aiModel, aiAspect, aiSize, aiCount]);
 
   // load available image models once
   useEffect(() => {
@@ -225,10 +240,16 @@ export default function Editor() {
   // toggling between different-resolution versions keeps a constant size.
   const frame = useRef<{ cx: number; cy: number; w: number; h: number } | null>(null);
 
+  // What the stage is actually showing. While judging results that is the
+  // selected candidate, so every measurement below - sizing, framing, the
+  // status bar - reports the picture in front of you rather than the committed
+  // one behind it.
+  const shown = (candidates && pick > 0 ? candidates[pick - 1].url : null) ?? current;
+
   useEffect(() => {
-    if (!current) return;
+    if (!shown) return;
     let cancelled = false;
-    loadImage(current).then((el) => {
+    loadImage(shown).then((el) => {
       if (cancelled) return;
       setImg(el);
       try {
@@ -267,7 +288,7 @@ export default function Editor() {
     return () => {
       cancelled = true;
     };
-  }, [current]);
+  }, [shown]);
 
   // Remember the current framing whenever the user zooms/pans or fits/opens,
   // but ignore view changes that came from an image swap (guarded above).
@@ -513,31 +534,76 @@ export default function Editor() {
         // re-frames the canvas and the empty band is still there.
         const aspect = mode === "fill" ? nearestAspect(width, height) : aiAspect;
 
-        const form = new FormData();
-        form.append("image", blob, "image.webp");
-        form.append("prompt", prompt);
-        if (aiModel) form.append("model", aiModel);
-        if (aspect) form.append("aspectRatio", aspect);
-        if (aiSize) form.append("imageSize", aiSize);
+        // One upload, several asks. The requests run together because they are
+        // independent and each one takes tens of seconds - four in sequence
+        // would be four times the wait for the same four pictures.
+        const runs = Math.min(MAX_VERSIONS, Math.max(1, aiCount));
+        const send = async () => {
+          const form = new FormData();
+          form.append("image", blob, "image.webp");
+          form.append("prompt", prompt);
+          if (aiModel) form.append("model", aiModel);
+          if (aspect) form.append("aspectRatio", aspect);
+          if (aiSize) form.append("imageSize", aiSize);
 
-        const res = await fetch("/api/ai-edit", { method: "POST", body: form });
-        if (!res.ok) throw new Error(await errorFromResponse(res));
+          const res = await fetch("/api/ai-edit", { method: "POST", body: form });
+          if (!res.ok) throw new Error(await errorFromResponse(res));
+          const out = await res.blob();
+          if (out.size === 0) throw new Error("The model returned an empty image.");
+          return { url: URL.createObjectURL(out), mime: out.type || "image/png" };
+        };
 
-        const out = await res.blob();
-        if (out.size === 0) throw new Error("The model returned an empty image.");
+        const settled = await Promise.allSettled(Array.from({ length: runs }, send));
+        const got = settled.flatMap((r) => (r.status === "fulfilled" ? [r.value] : []));
+        if (!got.length) {
+          const first = settled.find((r) => r.status === "rejected") as PromiseRejectedResult | undefined;
+          throw first?.reason instanceof Error ? first.reason : new Error("AI request failed.");
+        }
+
         const label = mode === "fill" ? "AI: fill empty space" : `AI: ${extra}`;
-        pushState(URL.createObjectURL(out), label, out.type || "image/png");
         setAiPrompt(""); // clear on success; stay on the AI tool for the next edit
+        if (got.length < runs) {
+          setNotice(`${got.length} of ${runs} versions came back. Showing what arrived.`);
+        }
+
+        // One result is not a choice, so it is committed straight away. Several
+        // are held out of the history until one is picked - a rejected version
+        // should leave no trace to step back through.
+        if (got.length === 1) {
+          pushState(got[0].url, label, got[0].mime);
+        } else {
+          candidateLabel.current = label;
+          setCandidates(got);
+          setPick(1);
+        }
       } catch (e) {
         setError(e instanceof Error ? e.message : "AI request failed.");
       } finally {
         setAiBusy(false);
       }
     },
-    [img, aiPrompt, aiModel, aiAspect, aiSize, flatten, pushState]
+    [img, aiPrompt, aiModel, aiAspect, aiSize, aiCount, flatten, pushState]
   );
 
+  /** Take the selected version (or keep the original) and let the rest go. */
+  const commitPick = useCallback(() => {
+    if (!candidates) return;
+    const chosen = pick > 0 ? candidates[pick - 1] : null;
+    for (const c of candidates) if (c !== chosen) revoke(c.url);
+    setCandidates(null);
+    setPick(0);
+    if (chosen) pushState(chosen.url, candidateLabel.current, chosen.mime);
+  }, [candidates, pick, pushState]);
+
+  const discardPicks = useCallback(() => {
+    if (!candidates) return;
+    for (const c of candidates) revoke(c.url);
+    setCandidates(null);
+    setPick(0);
+  }, [candidates]);
+
   const doDownload = useCallback(async (): Promise<boolean> => {
+    if (choosing) return false; // saving a version you have not accepted yet
     try {
       const flat = await flatten();
       const mime = typesRef.current.get(flat.src) || "image/png";
@@ -557,7 +623,7 @@ export default function Editor() {
       setError(e instanceof Error ? e.message : "Could not export the image.");
       return false;
     }
-  }, [flatten, sourceName]);
+  }, [choosing, flatten, sourceName]);
 
   // Unsaved changes = current differs from the last opened/saved image,
   // or there are uncommitted live adjustments.
@@ -568,9 +634,10 @@ export default function Editor() {
 
   const triggerPicker = useCallback(() => openInputRef.current?.click(), []);
   const requestOpen = useCallback(() => {
+    if (choosing) return; // answer the version question first
     if (dirty) setPendingOpen({ kind: "picker" });
     else triggerPicker();
-  }, [dirty, triggerPicker]);
+  }, [choosing, dirty, triggerPicker]);
 
   /**
    * A file dropped on the window.
@@ -580,10 +647,11 @@ export default function Editor() {
    */
   const requestOpenFile = useCallback(
     (file: File) => {
+      if (choosing) return;
       if (!currentRef.current) void openFile(file);
       else setPendingOpen({ kind: "file", file });
     },
-    [openFile]
+    [choosing, openFile]
   );
 
   // Files dropped anywhere but the stage used to be handled by the browser,
@@ -729,12 +797,54 @@ export default function Editor() {
   fitRef.current = fitToScreen;
   const requestOpenRef = useRef(requestOpen);
   requestOpenRef.current = requestOpen;
+  const chooseRef = useRef<{
+    n: number;
+    commit: () => void;
+    discard: () => void;
+  } | null>(null);
+  chooseRef.current = candidates ? { n: candidates.length, commit: commitPick, discard: discardPicks } : null;
 
   // space-to-pan + shortcuts
   useEffect(() => {
     const isTyping = (t: EventTarget | null) =>
       t instanceof HTMLElement && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.tagName === "SELECT");
     const down = (e: KeyboardEvent) => {
+      // Judging results takes the keyboard over: the same ← / → that walk the
+      // history walk the versions, and nothing else should reach the image
+      // while there is an unanswered question on screen.
+      const c = chooseRef.current;
+      if (c && (e.ctrlKey || e.metaKey) && ["z", "y"].includes(e.key.toLowerCase())) {
+        e.preventDefault(); // no stepping the history while a version is pending
+        return;
+      }
+      if (c && !e.ctrlKey && !e.metaKey && !e.altKey && !isTyping(e.target)) {
+        const k = e.key;
+        if (k === "ArrowLeft" || k === "ArrowRight") {
+          e.preventDefault();
+          setPick((p) => Math.min(c.n, Math.max(0, p + (k === "ArrowRight" ? 1 : -1))));
+          return;
+        }
+        if (/^[0-9]$/.test(k)) {
+          e.preventDefault();
+          setPick(Math.min(c.n, Number(k)));
+          return;
+        }
+        if (k === "Enter") {
+          e.preventDefault();
+          c.commit();
+          return;
+        }
+        if (k === "Escape") {
+          e.preventDefault();
+          c.discard();
+          return;
+        }
+        // Everything else is swallowed. Looking at a version that is not
+        // committed yet, a crop or an undo would act on state the picture on
+        // screen does not belong to. Fit and fullscreen only move the camera.
+        if (!["f", "r", "F", "R"].includes(k)) return;
+      }
+
       if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "z") {
         e.preventDefault();
         e.shiftKey ? stepBack() : toggleLast();
@@ -815,6 +925,7 @@ export default function Editor() {
     >
       <Sidebar
         hasImage={!!current}
+        choosing={choosing}
         history={history}
         step={index}
         onUndo={stepBack}
@@ -877,10 +988,10 @@ export default function Editor() {
             </div>
           )}
 
-          {current && imgBox && (
+          {shown && imgBox && (
             <>
               <img
-                src={current}
+                src={shown}
                 alt="editing"
                 draggable={false}
                 style={{
@@ -929,7 +1040,7 @@ export default function Editor() {
           </div>
 
           {/* floating AI prompt bar, below the image */}
-          {panel === "ai" && (
+          {panel === "ai" && !choosing && (
             <div
               style={aiBar}
               // The stage captures the pointer on any pointerdown that reaches
@@ -940,7 +1051,9 @@ export default function Editor() {
               {aiBusy && (
                 <div style={aiBusyOverlay}>
                   <span className="spinner" />
-                  <span style={{ fontSize: 12 }}>Generating with {aiModel || "model"}…</span>
+                  <span style={{ fontSize: 12 }}>
+                    {aiCount > 1 ? `Generating ${aiCount} versions` : "Generating"} with {aiModel || "model"}…
+                  </span>
                 </div>
               )}
               <div style={{ display: "flex", gap: 8, alignItems: "flex-end" }}>
@@ -986,6 +1099,37 @@ export default function Editor() {
                 </button>
               )}
 
+              {/* How many to ask for. Kept beside Generate rather than buried in
+                  the settings panel, because it multiplies what a click costs. */}
+              <div style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 8 }}>
+                <span style={{ ...label, color: "var(--muted)" }}>Versions</span>
+                <div style={segmented}>
+                  {Array.from({ length: MAX_VERSIONS }, (_, i) => i + 1).map((n) => (
+                    <button
+                      key={n}
+                      onClick={() => setAiCount(n)}
+                      disabled={aiBusy}
+                      aria-pressed={aiCount === n}
+                      title={n === 1 ? "One result, applied straight away" : `${n} results to choose between`}
+                      style={{
+                        ...segment,
+                        background: aiCount === n ? "var(--accent)" : "transparent",
+                        color: aiCount === n ? "#fff" : "var(--muted)",
+                        fontWeight: aiCount === n ? 700 : 500,
+                      }}
+                    >
+                      {n}
+                    </button>
+                  ))}
+                </div>
+                <span style={{ ...hint, fontSize: 11 }}>
+                  {aiCount === 1 ? "applied straight away" : "you pick one afterwards"}
+                </span>
+                <span style={{ ...hint, fontSize: 11, marginLeft: "auto" }}>
+                  {lastUpload ? `Sent ${lastUpload}` : `Sends a copy at up to ${AI_MAX_EDGE[aiSize] ?? AI_MAX_EDGE[""]} px`}
+                </span>
+              </div>
+
               <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginTop: 8, alignItems: "center" }}>
                 {["Remove background", "Black & white film", "Enhance & sharpen", "Golden-hour light"].map((p) => (
                   <button
@@ -997,9 +1141,57 @@ export default function Editor() {
                     {p}
                   </button>
                 ))}
-                <span style={{ ...hint, fontSize: 11, marginLeft: "auto" }}>
-                  {lastUpload ? `Sent ${lastUpload}` : `Sends a copy at up to ${AI_MAX_EDGE[aiSize] ?? AI_MAX_EDGE[""]} px`}
+              </div>
+            </div>
+          )}
+
+          {/* The chooser. Takes the AI bar's place so there is one thing to
+              answer, and lives outside the panel check so closing the panel
+              cannot orphan four unjudged results. */}
+          {candidates && (
+            <div style={aiBar} onPointerDown={(e) => e.stopPropagation()}>
+              <div style={{ display: "flex", alignItems: "baseline", gap: 8, marginBottom: 10 }}>
+                <span style={{ fontSize: 13, fontWeight: 600 }}>
+                  {candidates.length} versions came back - pick the one you want
                 </span>
+                <span style={{ ...hint, fontSize: 11, marginLeft: "auto" }}>
+                  ← → to step, Enter to keep, Esc to discard
+                </span>
+              </div>
+
+              <div style={{ display: "flex", gap: 8, overflowX: "auto", paddingBottom: 2 }}>
+                {[{ url: current, name: "Original" }, ...candidates.map((c, i) => ({ url: c.url, name: `${i + 1}` }))].map(
+                  (t, i) => (
+                    <button
+                      key={t.url ?? i}
+                      onClick={() => setPick(i)}
+                      aria-pressed={pick === i}
+                      title={i === 0 ? "The photo you started from" : `Version ${i}`}
+                      style={{
+                        ...thumbBtn,
+                        borderColor: pick === i ? "var(--accent)" : "var(--border)",
+                        boxShadow: pick === i ? "0 0 0 2px rgba(76,141,255,0.35)" : "none",
+                      }}
+                    >
+                      {t.url && <img src={t.url} alt={t.name} style={thumbImg} draggable={false} />}
+                      <span style={{ ...thumbLabel, color: pick === i ? "var(--text)" : "var(--muted)" }}>{t.name}</span>
+                    </button>
+                  )
+                )}
+              </div>
+
+              <div style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 10 }}>
+                <span style={{ ...hint, fontSize: 11 }}>
+                  {pick === 0
+                    ? "Showing the photo you started from"
+                    : `Showing version ${pick} of ${candidates.length}`}
+                </span>
+                <button onClick={discardPicks} style={{ marginLeft: "auto" }}>
+                  Discard all
+                </button>
+                <button className="primary" onClick={commitPick}>
+                  {pick === 0 ? "Keep the original" : `Use version ${pick}`}
+                </button>
               </div>
             </div>
           )}
@@ -1391,6 +1583,9 @@ function Sidebar(props: {
   dirty: boolean;
   canPick: boolean;
   lastSave: { method: "picker" | "download"; name: string } | null;
+  // While unjudged AI results are on screen, everything that would edit or
+  // replace the photo underneath them is out of reach until one is chosen.
+  choosing: boolean;
   onZoomIn: () => void;
   onZoomOut: () => void;
   onFit: () => void;
@@ -1413,14 +1608,14 @@ function Sidebar(props: {
       </div>
 
       <GroupLabel>File</GroupLabel>
-      <Entry icon="open" label="Open" keyHint="Ctrl+O" onClick={props.onOpen} />
+      <Entry icon="open" label="Open" keyHint="Ctrl+O" onClick={props.onOpen} disabled={props.choosing} />
       <Entry
         icon="save"
         label={props.canPick ? "Save as…" : "Save"}
         keyHint="Ctrl+S"
         onClick={props.onSave}
         dot={props.dirty}
-        disabled={!props.hasImage}
+        disabled={!props.hasImage || props.choosing}
       />
       {/* Where the file goes, said before and after the fact - the commonest
           way to lose an edited photo is never being told where it landed. */}
@@ -1441,7 +1636,7 @@ function Sidebar(props: {
       <Entry
         icon="crop"
         label="Crop"
-        disabled={!props.hasImage}
+        disabled={!props.hasImage || props.choosing}
         keyHint="C"
         kind="panel"
         active={props.panel === "crop"}
@@ -1451,7 +1646,7 @@ function Sidebar(props: {
         <Entry
           icon="transform"
           label="Transform"
-          disabled={!props.hasImage}
+          disabled={!props.hasImage || props.choosing}
           keyHint="T"
           kind="popup"
           active={props.transformOpen}
@@ -1479,7 +1674,7 @@ function Sidebar(props: {
       <Entry
         icon="adjust"
         label="Adjustments"
-        disabled={!props.hasImage}
+        disabled={!props.hasImage || props.choosing}
         keyHint="I"
         kind="panel"
         active={props.panel === "adjust"}
@@ -1488,7 +1683,7 @@ function Sidebar(props: {
       <Entry
         icon="ai"
         label="AI Edit"
-        disabled={!props.hasImage}
+        disabled={!props.hasImage || props.choosing}
         keyHint="A"
         kind="panel"
         active={props.panel === "ai"}
@@ -1510,7 +1705,12 @@ function Sidebar(props: {
 
         <div style={stepRow}>
           <Tip tip={TIPS.back}>
-            <button onClick={props.onUndo} disabled={!props.canUndo} aria-label="Previous version" style={stepArrow}>
+            <button
+              onClick={props.onUndo}
+              disabled={!props.canUndo || props.choosing}
+              aria-label="Previous version"
+              style={stepArrow}
+            >
               ◀
             </button>
           </Tip>
@@ -1518,13 +1718,20 @@ function Sidebar(props: {
             {props.history.length ? `${props.step + 1} / ${props.history.length}` : "-"}
           </span>
           <Tip tip={TIPS.forward}>
-            <button onClick={props.onRedo} disabled={!props.canRedo} aria-label="Next version" style={stepArrow}>
+            <button
+              onClick={props.onRedo}
+              disabled={!props.canRedo || props.choosing}
+              aria-label="Next version"
+              style={stepArrow}
+            >
               ▶
             </button>
           </Tip>
         </div>
         <div style={{ ...saveWhere, padding: "4px 14px 0", textAlign: "center" }}>
-          {props.stepLabel ? props.stepLabel : "Use ← and → to step through versions"}
+          {props.choosing
+            ? "Pick one of the new versions below the photo"
+            : props.stepLabel || "Use ← and → to step through versions"}
         </div>
 
         <div style={{ ...groupLabel, padding: "10px 14px 6px", opacity: 0.6 }}>Compare to</div>
@@ -1532,7 +1739,7 @@ function Sidebar(props: {
           <Tip tip={TIPS.original} grow>
             <button
               onClick={() => props.onCompare("original")}
-              disabled={!props.canUndo && !props.comparing}
+              disabled={(!props.canUndo && !props.comparing) || props.choosing}
               style={{ ...miniBtn, width: "100%", ...(props.comparing ? comparingBtn : null) }}
             >
               Original
@@ -1541,7 +1748,7 @@ function Sidebar(props: {
           <Tip tip={TIPS.previous} grow>
             <button
               onClick={() => props.onCompare("previous")}
-              disabled={!props.canUndo && !props.comparing}
+              disabled={(!props.canUndo && !props.comparing) || props.choosing}
               style={{ ...miniBtn, width: "100%", ...(props.comparing ? comparingBtn : null) }}
             >
               Last change
@@ -1599,7 +1806,7 @@ const TIPS: Record<string, TipText> = {
   ai: {
     title: "AI edit",
     body:
-      "Describe a change in plain words and the image model redraws the photo. Also where Fill empty space lives, for space a crop-out added.",
+      "Describe a change in plain words and the image model redraws the photo. Ask for up to four versions and you pick the one you like; ask for one and it is applied straight away. Fill empty space lives here too.",
     keys: "A",
   },
   zoomIn: { title: "Zoom in", body: "Look closer at the photo. Scrolling the wheel over it does the same, centred on the pointer." },
@@ -2193,6 +2400,43 @@ const fillButton: React.CSSProperties = {
   color: "#cfe0ff",
   borderRadius: 9,
 };
+const segmented: React.CSSProperties = {
+  display: "flex",
+  gap: 2,
+  padding: 2,
+  borderRadius: 8,
+  background: "var(--bg)",
+  border: "1px solid var(--border)",
+};
+const segment: React.CSSProperties = {
+  width: 26,
+  padding: "3px 0",
+  border: "none",
+  borderRadius: 6,
+  fontSize: 12,
+  lineHeight: 1.4,
+  fontVariantNumeric: "tabular-nums",
+};
+const thumbBtn: React.CSSProperties = {
+  flexShrink: 0,
+  width: 72,
+  padding: 4,
+  display: "grid",
+  gap: 3,
+  justifyItems: "center",
+  border: "1px solid var(--border)",
+  borderRadius: 9,
+  background: "var(--panel-2)",
+};
+const thumbImg: React.CSSProperties = {
+  width: 62,
+  height: 62,
+  objectFit: "cover",
+  borderRadius: 6,
+  display: "block",
+  background: "repeating-conic-gradient(#141418 0% 25%, #101014 0% 50%) 50% / 10px 10px",
+};
+const thumbLabel: React.CSSProperties = { fontSize: 10.5, fontWeight: 600, lineHeight: 1.2 };
 const aiBusyOverlay: React.CSSProperties = {
   display: "flex",
   alignItems: "center",
