@@ -17,6 +17,8 @@ generative edits and compare before/after.
   and +10/25/50% buttons that grow the canvas past the photo. The added area is
   empty, and is what the AI fills.
 - **AI Edit** — describe a change; the photo is sent to Google's image model and returned as a new layer
+- **Rerun / Restore** — after a run, Rerun sends the same prompt again (the
+  model is not deterministic) and Restore puts it back in the box to change
 - **Versions** — ask for 1 to 4 results per run. One is applied straight away;
   several are held out of the history until you pick, with a thumbnail strip of
   the original plus each result (← / → to step, Enter to keep, Esc to discard)

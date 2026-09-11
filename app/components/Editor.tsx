@@ -180,6 +180,11 @@ export default function Editor({ active, file, onOpen, onStatus, models, ai, set
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null); // non-fatal, e.g. downscaled on open
   const [lastUpload, setLastUpload] = useState<string | null>(null); // what the last AI run sent
+  // The last prompt that was sent, and whether it was a plain edit or a fill.
+  // Generate clears the box on success, and the commonest next wish is either
+  // the same prompt again (the model is not deterministic) or the same prompt
+  // with a word changed - so it is kept, for Rerun and Restore.
+  const [lastRun, setLastRun] = useState<{ text: string; mode: "edit" | "fill" } | null>(null);
   const [savedUrl, setSavedUrl] = useState<string | null>(null); // last opened/saved image
   const savedUrlRef = useRef<string | null>(null);
   savedUrlRef.current = savedUrl;
@@ -511,11 +516,12 @@ export default function Editor({ active, file, onOpen, onStatus, models, ai, set
   }, [panel, img, stageSize.w, stageSize.h]);
 
   const runAI = useCallback(
-    async (mode: "edit" | "fill" = "edit") => {
-      const extra = aiPrompt.trim();
+    async (mode: "edit" | "fill" = "edit", text = aiPrompt) => {
+      const extra = text.trim();
       if (!img || (mode === "edit" && !extra)) return;
       setError(null);
       setAiBusy(true);
+      setLastRun({ text: extra, mode }); // remembered even if the run fails, so it can be retried
       try {
         const flat = await flatten();
         const margins = emptyMargins(flat);
@@ -563,7 +569,7 @@ export default function Editor({ active, file, onOpen, onStatus, models, ai, set
         }
 
         const label = mode === "fill" ? "AI: fill empty space" : `AI: ${extra}`;
-        setAiPrompt(""); // clear on success; stay on the AI tool for the next edit
+        setAiPrompt(""); // clear on success; stay on the AI tool for the next edit (Restore brings it back)
         if (got.length < runs) {
           setNotice(`${got.length} of ${runs} versions came back. Showing what arrived.`);
         }
@@ -1035,6 +1041,42 @@ export default function Editor({ active, file, onOpen, onStatus, models, ai, set
                   {aiBusy ? "…" : "Generate"}
                 </button>
               </div>
+
+              {/* The last prompt, twice over: once to send it again as it was,
+                  once to get it back into the box to change. Only shown once
+                  there is one, so the bar starts as plain as before. */}
+              {lastRun && (
+                <div style={{ display: "flex", alignItems: "center", gap: 6, marginTop: 8, minWidth: 0 }}>
+                  <button
+                    onClick={() => void runAI(lastRun.mode, lastRun.text)}
+                    disabled={aiBusy}
+                    style={rerunBtn}
+                    title={
+                      lastRun.mode === "fill"
+                        ? "Run Fill empty space again with the same prompt"
+                        : "Send the same prompt again - the model gives a different result each time"
+                    }
+                  >
+                    ↻ Rerun
+                  </button>
+                  <button
+                    onClick={() => {
+                      setAiPrompt(lastRun.text);
+                      aiInputRef.current?.focus();
+                    }}
+                    disabled={aiBusy || aiPrompt === lastRun.text}
+                    style={rerunBtn}
+                    title="Put the last prompt back in the box, to change it"
+                  >
+                    ↶ Restore
+                  </button>
+                  <span style={{ ...hint, fontSize: 11, ...ellipsis }} title={lastRun.text || "Fill empty space"}>
+                    {lastRun.mode === "fill" ? "Fill empty space" : ""}
+                    {lastRun.mode === "fill" && lastRun.text ? " + " : ""}
+                    {lastRun.text && <em style={{ color: "var(--text)", fontStyle: "normal" }}>“{lastRun.text}”</em>}
+                  </span>
+                </div>
+              )}
 
               {/* Only offered when there is actually empty space to fill, so the
                   button is never a promise the image cannot keep. */}
@@ -2258,6 +2300,17 @@ const cropReadout: React.CSSProperties = {
   border: "1px solid var(--border)",
   fontSize: 12,
   color: "var(--muted)",
+};
+const rerunBtn: React.CSSProperties = {
+  flexShrink: 0,
+  fontSize: 11,
+  padding: "4px 8px",
+};
+const ellipsis: React.CSSProperties = {
+  minWidth: 0,
+  overflow: "hidden",
+  textOverflow: "ellipsis",
+  whiteSpace: "nowrap",
 };
 const fillButton: React.CSSProperties = {
   display: "flex",
