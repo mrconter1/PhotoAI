@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useImperativeHandle, useMemo, useRef, useState } from "react";
 import {
   AI_MAX_EDGE,
   Adjustments,
@@ -25,6 +25,7 @@ import {
   scaleCrop,
 } from "@/lib/image";
 import CropOverlay from "./CropOverlay";
+import { hint } from "./styles";
 
 // Every entry in the left sidebar is one of three kinds: an action runs at
 // once, a popup opens over the sidebar, and these open in the side panel.
@@ -37,7 +38,7 @@ const FULL_CROP: CropRect = { x: 0, y: 0, w: 1, h: 1 };
 const MAX_HISTORY = 40;
 // Versions one Generate may ask for. Four is where the thumbnail strip still
 // reads at a glance, and it is four times the cost of one - a cap, not a target.
-const MAX_VERSIONS = 4;
+export const MAX_VERSIONS = 4;
 const EXT: Record<string, string> = {
   "image/png": "png",
   "image/jpeg": "jpg",
@@ -111,7 +112,38 @@ function fillPrompt(margins: Margins | null, extra: string): string {
     .join(" ");
 }
 
-export default function Editor() {
+/** The AI preferences. One set for the whole workspace, not one per tab. */
+export type AiSettings = { model: string; aspect: string; size: string; count: number };
+
+/** What the workspace needs to know about a tab to name it and to close it. */
+export type EditorStatus = { hasImage: boolean; dirty: boolean; name: string | null; choosing: boolean };
+
+/** What the workspace can ask a tab to do. */
+export type EditorHandle = {
+  /** Save the photo as it looks now. Resolves false if nothing was written. */
+  save: () => Promise<boolean>;
+};
+
+type EditorProps = {
+  /** The tab on screen. Hidden editors keep their state but ignore the keyboard. */
+  active: boolean;
+  /** Opened once, on mount. null is an empty tab waiting for a photo. */
+  file: File | null;
+  /** Ask the workspace for its file picker (Open, Ctrl+O, the empty-stage button). */
+  onOpen: () => void;
+  onStatus: (status: EditorStatus) => void;
+  models: string[];
+  ai: AiSettings;
+  setAi: (patch: Partial<AiSettings>) => void;
+  ref?: React.Ref<EditorHandle>;
+};
+
+/**
+ * One photo and everything done to it. The workspace mounts one of these per
+ * tab and keeps them all mounted, so switching tabs costs nothing and every
+ * tab keeps its history, zoom and open panel.
+ */
+export default function Editor({ active, file, onOpen, onStatus, models, ai, setAi, ref }: EditorProps) {
   // history of baked PNG object URLs (blob:); index = current state
   const [history, setHistory] = useState<string[]>([]);
   const [index, setIndex] = useState(-1);
@@ -123,10 +155,6 @@ export default function Editor() {
   const indexRef = useRef(-1);
   historyRef.current = history;
   indexRef.current = index;
-  // Read by the drop handler, which must not be rebuilt on every history change.
-  const currentRef = useRef<string | null>(null);
-  currentRef.current = current;
-
   // What each history URL actually holds. Bakes are PNG, but a model may hand
   // back JPEG or WebP, and the export should not lie about the extension.
   const typesRef = useRef(new Map<string, string>());
@@ -155,11 +183,6 @@ export default function Editor() {
   const [savedUrl, setSavedUrl] = useState<string | null>(null); // last opened/saved image
   const savedUrlRef = useRef<string | null>(null);
   savedUrlRef.current = savedUrl;
-  // A photo waiting on a yes: either the file picker should be opened, or this
-  // dropped file should replace what is on the stage.
-  const [pendingOpen, setPendingOpen] = useState<{ kind: "picker" } | { kind: "file"; file: File } | null>(null);
-  const [dragging, setDragging] = useState(false);
-  const openInputRef = useRef<HTMLInputElement>(null);
   const [sourceName, setSourceName] = useState<string | null>(null); // file the photo came from
   const [lastSave, setLastSave] = useState<{ method: "picker" | "download"; name: string } | null>(null);
   // Whether this browser can offer a real Save As dialog. Read once on the
@@ -167,12 +190,13 @@ export default function Editor() {
   const [canPick, setCanPick] = useState(false);
   useEffect(() => setCanPick(canPickSaveLocation()), []);
 
-  // AI settings
-  const [models, setModels] = useState<string[]>([]);
-  const [aiModel, setAiModel] = useState("");
-  const [aiAspect, setAiAspect] = useState(""); // "" = match input
-  const [aiSize, setAiSize] = useState(""); // "" = model default
-  const [aiCount, setAiCount] = useState(1); // versions per run, 1..MAX_VERSIONS
+  // AI settings live in the workspace, shared by every tab. Read here under
+  // the names the rest of the editor grew up with.
+  const { model: aiModel, aspect: aiAspect, size: aiSize, count: aiCount } = ai;
+  const setAiModel = (model: string) => setAi({ model });
+  const setAiAspect = (aspect: string) => setAi({ aspect });
+  const setAiSize = (size: string) => setAi({ size });
+  const setAiCount = (count: number) => setAi({ count });
 
   // Results waiting to be judged. More than one and nothing is committed until
   // the person picks; a single result goes straight into the history as before.
@@ -181,46 +205,6 @@ export default function Editor() {
   const candidateLabel = useRef("");
   const choosing = candidates !== null;
   const aiInputRef = useRef<HTMLTextAreaElement>(null);
-  const hydrated = useRef(false);
-
-  // restore saved AI settings (client-only) before anything overrides them
-  useEffect(() => {
-    try {
-      const raw = localStorage.getItem("photoai:ai");
-      if (raw) {
-        const s = JSON.parse(raw);
-        if (typeof s.model === "string") setAiModel(s.model);
-        if (typeof s.aspect === "string") setAiAspect(s.aspect);
-        if (typeof s.size === "string") setAiSize(s.size);
-        if (Number.isInteger(s.count)) setAiCount(Math.min(MAX_VERSIONS, Math.max(1, s.count)));
-      }
-    } catch {}
-    hydrated.current = true;
-  }, []);
-
-  // persist AI settings whenever they change (after hydration)
-  useEffect(() => {
-    if (!hydrated.current) return;
-    try {
-      localStorage.setItem(
-        "photoai:ai",
-        JSON.stringify({ model: aiModel, aspect: aiAspect, size: aiSize, count: aiCount })
-      );
-    } catch {}
-  }, [aiModel, aiAspect, aiSize, aiCount]);
-
-  // load available image models once
-  useEffect(() => {
-    fetch("/api/models")
-      .then((r) => r.json())
-      .then((d) => {
-        if (Array.isArray(d.models)) {
-          setModels(d.models);
-          setAiModel((m) => m || d.default || d.models[0] || "");
-        }
-      })
-      .catch(() => {});
-  }, []);
 
   // auto-focus the prompt when the AI tool is chosen
   useEffect(() => {
@@ -407,6 +391,24 @@ export default function Editor() {
       setError(e instanceof Error ? e.message : "Could not open image.");
     }
   }, []);
+
+  // The tab's photo is decided when the tab is made, so it opens once.
+  useEffect(() => {
+    if (file) void openFile(file);
+  }, [file, openFile]);
+
+  // A closed tab takes its blobs with it. Nothing else revokes them: the
+  // history only frees what falls out of it, and a whole history at once
+  // is what closing a tab drops.
+  const candidatesRef = useRef<{ url: string }[] | null>(null);
+  candidatesRef.current = candidates;
+  useEffect(
+    () => () => {
+      for (const u of historyRef.current) revoke(u);
+      for (const c of candidatesRef.current ?? []) revoke(c.url);
+    },
+    []
+  );
 
   const flatten = useCallback(async (): Promise<HTMLImageElement> => {
     if (!img) throw new Error("No image.");
@@ -632,61 +634,10 @@ export default function Editor() {
     (current !== savedUrl ||
       adjustmentsToFilter(adjust) !== adjustmentsToFilter(NEUTRAL_ADJUSTMENTS));
 
-  const triggerPicker = useCallback(() => openInputRef.current?.click(), []);
-  const requestOpen = useCallback(() => {
-    if (choosing) return; // answer the version question first
-    if (dirty) setPendingOpen({ kind: "picker" });
-    else triggerPicker();
-  }, [choosing, dirty, triggerPicker]);
-
-  /**
-   * A file dropped on the window.
-   * Nothing open, nothing to lose - it just opens. With a photo already on the
-   * stage it always asks first: a drop is easy to make by accident, and the
-   * thing it would throw away is someone's work.
-   */
-  const requestOpenFile = useCallback(
-    (file: File) => {
-      if (choosing) return;
-      if (!currentRef.current) void openFile(file);
-      else setPendingOpen({ kind: "file", file });
-    },
-    [choosing, openFile]
-  );
-
-  // Files dropped anywhere but the stage used to be handled by the browser,
-  // which navigates the tab to the image and takes every unsaved edit with it.
+  // What the tab strip shows and what closing the tab has to know.
   useEffect(() => {
-    const swallow = (e: DragEvent) => e.preventDefault();
-    window.addEventListener("dragover", swallow);
-    window.addEventListener("drop", swallow);
-    return () => {
-      window.removeEventListener("dragover", swallow);
-      window.removeEventListener("drop", swallow);
-    };
-  }, []);
-
-  // dragenter/dragleave fire for every child the pointer crosses, so the depth
-  // is counted rather than toggled - otherwise the hint flickers on the way in.
-  const dragDepth = useRef(0);
-  const hasFiles = (e: React.DragEvent) => Array.from(e.dataTransfer.types || []).includes("Files");
-  const onDragEnter = (e: React.DragEvent) => {
-    if (!hasFiles(e)) return;
-    dragDepth.current += 1;
-    setDragging(true);
-  };
-  const onDragLeave = (e: React.DragEvent) => {
-    if (!hasFiles(e)) return;
-    dragDepth.current = Math.max(0, dragDepth.current - 1);
-    if (!dragDepth.current) setDragging(false);
-  };
-  const onDrop = (e: React.DragEvent) => {
-    e.preventDefault();
-    dragDepth.current = 0;
-    setDragging(false);
-    const file = e.dataTransfer.files?.[0];
-    if (file) requestOpenFile(file);
-  };
+    onStatus({ hasImage: current !== null, dirty, name: sourceName, choosing });
+  }, [onStatus, current, dirty, sourceName, choosing]);
 
   // Ctrl+Z: A/B toggle between the current state and the previous one
   // (repeated presses flip back and forth to compare the last change).
@@ -764,10 +715,15 @@ export default function Editor() {
     else el.requestFullscreen?.();
   }, []);
 
+  // Hidden tabs keep their state but must not answer the keyboard, or one
+  // Ctrl+Z would step every tab back at once.
+  const activeRef = useRef(active);
+  activeRef.current = active;
+
   // re-fit the image when entering/exiting fullscreen (stage size changes)
   useEffect(() => {
     const onFs = () => {
-      pendingFit.current = true;
+      if (activeRef.current) pendingFit.current = true;
     };
     document.addEventListener("fullscreenchange", onFs);
     return () => document.removeEventListener("fullscreenchange", onFs);
@@ -795,8 +751,10 @@ export default function Editor() {
   downloadRef.current = doDownload;
   const fitRef = useRef(fitToScreen);
   fitRef.current = fitToScreen;
-  const requestOpenRef = useRef(requestOpen);
-  requestOpenRef.current = requestOpen;
+  const onOpenRef = useRef(onOpen);
+  onOpenRef.current = onOpen;
+  // The workspace's close prompt needs to save on the tab's behalf.
+  useImperativeHandle(ref, () => ({ save: () => downloadRef.current() }), []);
   const chooseRef = useRef<{
     n: number;
     commit: () => void;
@@ -809,6 +767,7 @@ export default function Editor() {
     const isTyping = (t: EventTarget | null) =>
       t instanceof HTMLElement && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.tagName === "SELECT");
     const down = (e: KeyboardEvent) => {
+      if (!activeRef.current) return;
       // Judging results takes the keyboard over: the same ← / → that walk the
       // history walk the versions, and nothing else should reach the image
       // while there is an unanswered question on screen.
@@ -856,7 +815,7 @@ export default function Editor() {
         void downloadRef.current(); // save the current image
       } else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "o") {
         e.preventDefault();
-        requestOpenRef.current(); // open new photo (guards unsaved changes)
+        onOpenRef.current(); // open more photos, each in its own tab
       } else if (!e.ctrlKey && !e.metaKey && !e.altKey && !isTyping(e.target)) {
         // single-key tool / panel shortcuts
         const k = e.key.toLowerCase();
@@ -916,13 +875,7 @@ export default function Editor() {
   const adjustDirty = adjustmentsToFilter(adjust) !== adjustmentsToFilter(NEUTRAL_ADJUSTMENTS);
 
   return (
-    <div
-      style={{ display: "flex", height: "100vh" }}
-      onDragEnter={onDragEnter}
-      onDragOver={(e) => e.preventDefault()}
-      onDragLeave={onDragLeave}
-      onDrop={onDrop}
-    >
+    <div style={{ display: active ? "flex" : "none", flex: 1, minHeight: 0 }}>
       <Sidebar
         hasImage={!!current}
         choosing={choosing}
@@ -943,7 +896,7 @@ export default function Editor() {
           setTransformOpen(false);
           void applyTransform(r, fh, fv);
         }}
-        onOpen={requestOpen}
+        onOpen={onOpen}
         onSave={doDownload}
         dirty={dirty}
         canPick={canPick}
@@ -979,7 +932,7 @@ export default function Editor() {
               </p>
               <button
                 className="primary"
-                onClick={triggerPicker}
+                onClick={onOpen}
                 onPointerDown={(e) => e.stopPropagation()}
                 style={{ pointerEvents: "auto" }}
               >
@@ -1392,84 +1345,6 @@ export default function Editor() {
             </div>
           )}
         </aside>
-      )}
-
-      {/* hidden picker used by Open / Ctrl+O */}
-      <input
-        ref={openInputRef}
-        type="file"
-        accept="image/*"
-        style={{ display: "none" }}
-        onChange={(e) => {
-          const f = e.target.files?.[0];
-          e.target.value = ""; // allow re-picking the same file
-          if (f) void openFile(f);
-        }}
-      />
-
-      {/* drop hint, over everything while a file is being dragged in */}
-      {dragging && (
-        <div style={dropOverlay}>
-          <div style={dropCard}>
-            <div style={{ fontSize: 30, marginBottom: 8 }}>🖼️</div>
-            <div style={{ fontSize: 15, fontWeight: 600 }}>Drop the photo to open it</div>
-            <div style={{ ...hint, marginTop: 4 }}>
-              {current ? "You will be asked before it replaces the one you have open." : "It opens straight away."}
-            </div>
-          </div>
-        </div>
-      )}
-
-      {/* confirmation before a new photo takes the stage */}
-      {pendingOpen && (
-        <div style={modalBackdrop} onClick={() => setPendingOpen(null)}>
-          <div style={modalCard} onClick={(e) => e.stopPropagation()}>
-            <h2 style={{ margin: "0 0 6px", fontSize: 17 }}>
-              {pendingOpen.kind === "file" ? "Open this photo instead?" : "Unsaved changes"}
-            </h2>
-            <p style={{ margin: "0 0 18px", fontSize: 13, color: "var(--muted)", lineHeight: 1.5 }}>
-              {pendingOpen.kind === "file" && (
-                <>
-                  <strong style={{ color: "var(--text)" }}>{pendingOpen.file.name}</strong> would replace the photo you
-                  have open.{" "}
-                </>
-              )}
-              {dirty
-                ? "You have edits that haven't been saved yet, and they will be lost."
-                : "The current photo and its versions will be closed."}
-            </p>
-            <div style={{ display: "flex", gap: 8, justifyContent: "flex-end", flexWrap: "wrap" }}>
-              <button onClick={() => setPendingOpen(null)}>Cancel</button>
-              {dirty && (
-                <button
-                  onClick={async () => {
-                    // Only go on if the save actually happened - cancelling the
-                    // Save dialog used to throw the edits away anyway.
-                    const saved = await doDownload();
-                    if (!saved) return;
-                    const req = pendingOpen;
-                    setPendingOpen(null);
-                    if (req.kind === "file") void openFile(req.file);
-                    else triggerPicker();
-                  }}
-                >
-                  Save &amp; open
-                </button>
-              )}
-              <button
-                className="primary"
-                onClick={() => {
-                  const req = pendingOpen;
-                  setPendingOpen(null);
-                  if (req.kind === "file") void openFile(req.file);
-                  else triggerPicker();
-                }}
-              >
-                {dirty ? "Discard & open" : "Open"}
-              </button>
-            </div>
-          </div>
-        </div>
       )}
     </div>
   );
@@ -2101,7 +1976,6 @@ function Select({
 
 /* =========================== styles =========================== */
 const label: React.CSSProperties = { fontSize: 12, fontWeight: 600 };
-const hint: React.CSSProperties = { fontSize: 12, color: "var(--muted)", margin: 0, lineHeight: 1.5 };
 
 const sidebar: React.CSSProperties = {
   width: 194,
@@ -2443,43 +2317,6 @@ const aiBusyOverlay: React.CSSProperties = {
   gap: 10,
   color: "var(--muted)",
   marginBottom: 10,
-};
-const dropOverlay: React.CSSProperties = {
-  position: "fixed",
-  inset: 0,
-  zIndex: 150,
-  display: "flex",
-  alignItems: "center",
-  justifyContent: "center",
-  background: "rgba(14,14,17,0.72)",
-  backdropFilter: "blur(2px)",
-  pointerEvents: "none", // the drop still has to reach the page underneath
-};
-const dropCard: React.CSSProperties = {
-  textAlign: "center",
-  padding: "26px 34px",
-  borderRadius: 16,
-  border: "2px dashed var(--accent)",
-  background: "rgba(30,30,37,0.9)",
-  boxShadow: "0 24px 70px rgba(0,0,0,0.6)",
-};
-const modalBackdrop: React.CSSProperties = {
-  position: "fixed",
-  inset: 0,
-  background: "rgba(0,0,0,0.55)",
-  backdropFilter: "blur(2px)",
-  display: "flex",
-  alignItems: "center",
-  justifyContent: "center",
-  zIndex: 100,
-};
-const modalCard: React.CSSProperties = {
-  width: "min(420px, calc(100% - 32px))",
-  background: "var(--panel)",
-  border: "1px solid var(--border)",
-  borderRadius: 14,
-  padding: 22,
-  boxShadow: "0 20px 60px rgba(0,0,0,0.6)",
 };
 const errorBox: React.CSSProperties = {
   display: "flex",

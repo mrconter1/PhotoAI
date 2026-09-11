@@ -6,9 +6,11 @@ generative edits and compare before/after.
 
 ## Features
 
-- **Open** by dropping a file anywhere in the window, or via the file picker. A
-  drop onto an empty stage opens straight away; with a photo already open it
-  asks first, naming the file it would replace.
+- **Open** by dropping files anywhere in the window, or via the file picker.
+  Every photo opens in its own tab, so several can be open at once.
+- **Tabs** - each keeps its own history, zoom and open panel. Click to switch
+  (Alt+1..9 too), middle-click or × to close. A tab with unsaved edits asks
+  before it closes: save, discard, or cancel.
 - **Adjust** — brightness, contrast, saturation, warmth, grayscale, blur (live CSS-filter preview, baked on apply)
 - **Transform** — rotate 90°, flip horizontal/vertical
 - **Crop in or out** — rule-of-thirds crop with corner handles, ratio presets,
@@ -31,6 +33,9 @@ generative edits and compare before/after.
 - **Next.js (App Router) + React 19**. All editing runs client-side for speed;
   the only server code is `app/api/ai-edit/route.ts`, which keeps the Google API
   key server-side and proxies the request.
+- `Workspace` owns the tabs, the file picker, the drop zone and the shared AI
+  settings; each tab is an `Editor` that stays mounted while hidden, so
+  switching costs nothing and a tab's blobs are only freed when it closes.
 - Live adjustments use CSS `filter` (GPU) for smooth interaction; committing an
   edit bakes it into a fresh PNG via canvas (`lib/image.ts`) and pushes it onto
   the history stack.
