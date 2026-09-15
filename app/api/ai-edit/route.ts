@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { GoogleGenAI } from "@google/genai";
-import { Provider, openaiQuality, openaiSize, providerOf } from "@/lib/providers";
+import { GOOGLE_SIZES, Provider, openaiQuality, openaiSize, providerOf } from "@/lib/providers";
 
 // Node runtime: keeps the API keys server-side and handles larger payloads.
 export const runtime = "nodejs";
@@ -45,9 +45,11 @@ async function editWithGoogle(apiKey: string, e: Edit) {
   const data = Buffer.from(await e.file.arrayBuffer()).toString("base64");
 
   // Optional image config (aspect ratio / resolution) - only sent when set.
+  // A size tier that is not Google's (an OpenAI quality left over from a
+  // model switch) is dropped rather than sent: Google answers it with a 400.
   const imageConfig: Record<string, string> = {};
   if (e.aspectRatio) imageConfig.aspectRatio = e.aspectRatio;
-  if (e.imageSize) imageConfig.imageSize = e.imageSize;
+  if (GOOGLE_SIZES.includes(e.imageSize)) imageConfig.imageSize = e.imageSize;
   const config = Object.keys(imageConfig).length > 0 ? { imageConfig } : undefined;
 
   const ai = new GoogleGenAI({ apiKey });

@@ -3,7 +3,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import Editor, { AiSettings, EditorHandle, EditorStatus, MAX_VERSIONS } from "./Editor";
 import { dropCard, dropOverlay, hint, modalBackdrop, modalCard } from "./styles";
-import { ModelInfo } from "@/lib/providers";
+import { ModelInfo, providerOf } from "@/lib/providers";
 
 // A tab is a photo. The file is fixed when the tab is made; everything that
 // happens to the photo afterwards lives inside the tab's own Editor.
@@ -71,10 +71,13 @@ export default function Workspace() {
         if (Array.isArray(d.models) && d.models.length) {
           const list = d.models as ModelInfo[];
           setModels(list);
-          setAiState((a) => ({
-            ...a,
-            model: list.some((m) => m.id === a.model) ? a.model : d.default || list[0].id,
-          }));
+          setAiState((a) => {
+            if (list.some((m) => m.id === a.model)) return a;
+            const model = d.default || list[0].id;
+            // The fallback may land on the other provider, whose size and
+            // aspect settings mean something else - same reset as the picker.
+            return providerOf(model) === providerOf(a.model) ? { ...a, model } : { ...a, model, aspect: "", size: "" };
+          });
         }
       })
       .catch(() => {});
