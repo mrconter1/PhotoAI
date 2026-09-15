@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import Editor, { AiSettings, EditorHandle, EditorStatus, MAX_VERSIONS } from "./Editor";
 import { dropCard, dropOverlay, hint, modalBackdrop, modalCard } from "./styles";
+import { ModelInfo } from "@/lib/providers";
 
 // A tab is a photo. The file is fixed when the tab is made; everything that
 // happens to the photo afterwards lives inside the tab's own Editor.
@@ -30,7 +31,7 @@ export default function Workspace() {
   const inputRef = useRef<HTMLInputElement>(null);
 
   // ---- AI settings, shared and persisted ------------------------------------
-  const [models, setModels] = useState<string[]>([]);
+  const [models, setModels] = useState<ModelInfo[]>([]);
   const [ai, setAiState] = useState<AiSettings>(DEFAULT_AI);
   const setAi = useCallback((patch: Partial<AiSettings>) => setAiState((a) => ({ ...a, ...patch })), []);
   const hydrated = useRef(false);
@@ -60,14 +61,20 @@ export default function Workspace() {
     } catch {}
   }, [ai]);
 
-  // load available image models once
+  // load available image models once, from every provider with a key. A saved
+  // choice that is no longer on the list (key removed, model retired) falls
+  // back to the default rather than failing on the first Generate.
   useEffect(() => {
     fetch("/api/models")
       .then((r) => r.json())
       .then((d) => {
-        if (Array.isArray(d.models)) {
-          setModels(d.models);
-          setAiState((a) => ({ ...a, model: a.model || d.default || d.models[0] || "" }));
+        if (Array.isArray(d.models) && d.models.length) {
+          const list = d.models as ModelInfo[];
+          setModels(list);
+          setAiState((a) => ({
+            ...a,
+            model: list.some((m) => m.id === a.model) ? a.model : d.default || list[0].id,
+          }));
         }
       })
       .catch(() => {});

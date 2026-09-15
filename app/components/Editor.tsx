@@ -25,6 +25,15 @@ import {
   scaleCrop,
 } from "@/lib/image";
 import CropOverlay from "./CropOverlay";
+import {
+  GOOGLE_ASPECTS,
+  GOOGLE_SIZES,
+  ModelInfo,
+  OPENAI_ASPECTS,
+  OPENAI_QUALITIES,
+  PROVIDER_NAME,
+  providerOf,
+} from "@/lib/providers";
 import { hint } from "./styles";
 
 // Every entry in the left sidebar is one of three kinds: an action runs at
@@ -132,7 +141,7 @@ type EditorProps = {
   /** Ask the workspace for its file picker (Open, Ctrl+O, the empty-stage button). */
   onOpen: () => void;
   onStatus: (status: EditorStatus) => void;
-  models: string[];
+  models: ModelInfo[];
   ai: AiSettings;
   setAi: (patch: Partial<AiSettings>) => void;
   ref?: React.Ref<EditorHandle>;
@@ -198,7 +207,13 @@ export default function Editor({ active, file, onOpen, onStatus, models, ai, set
   // AI settings live in the workspace, shared by every tab. Read here under
   // the names the rest of the editor grew up with.
   const { model: aiModel, aspect: aiAspect, size: aiSize, count: aiCount } = ai;
-  const setAiModel = (model: string) => setAi({ model });
+  const provider = providerOf(aiModel);
+  // Aspect and size mean different things to the two providers (a ratio and a
+  // resolution tier for Google, a fixed size and a quality tier for OpenAI),
+  // so crossing over resets them rather than carrying a value the other side
+  // would misread.
+  const setAiModel = (model: string) =>
+    setAi(providerOf(model) === provider ? { model } : { model, aspect: "", size: "" });
   const setAiAspect = (aspect: string) => setAi({ aspect });
   const setAiSize = (size: string) => setAi({ size });
   const setAiCount = (count: number) => setAi({ count });
@@ -551,6 +566,7 @@ export default function Editor({ active, file, onOpen, onStatus, models, ai, set
           form.append("image", blob, "image.webp");
           form.append("prompt", prompt);
           if (aiModel) form.append("model", aiModel);
+          form.append("provider", provider);
           if (aspect) form.append("aspectRatio", aspect);
           if (aiSize) form.append("imageSize", aiSize);
 
@@ -590,7 +606,7 @@ export default function Editor({ active, file, onOpen, onStatus, models, ai, set
         setAiBusy(false);
       }
     },
-    [img, aiPrompt, aiModel, aiAspect, aiSize, aiCount, flatten, pushState]
+    [img, aiPrompt, aiModel, provider, aiAspect, aiSize, aiCount, flatten, pushState]
   );
 
   /** Take the selected version (or keep the original) and let the rest go. */
@@ -1346,37 +1362,50 @@ export default function Editor({ active, file, onOpen, onStatus, models, ai, set
 
           {panel === "ai" && (
             <div style={panelBody}>
-              <Field label="Model" hint="Your Google account's available image models.">
+              <Field label="Model" hint="Every image model the configured keys can reach. The choice is remembered.">
                 <Select
                   value={aiModel}
                   onChange={setAiModel}
-                  options={models.map((m) => ({ value: m, label: m }))}
+                  options={models.map((m) => ({ value: m.id, label: `${PROVIDER_NAME[m.provider]} · ${m.id}` }))}
                   placeholder={models.length ? "Pick a model" : "Loading…"}
                 />
               </Field>
-              <Field label="Aspect ratio">
-                <Select
-                  value={aiAspect}
-                  onChange={setAiAspect}
-                  options={[
-                    { value: "", label: "Match input" },
-                    ...["1:1", "3:2", "2:3", "4:3", "3:4", "16:9", "9:16", "21:9"].map((r) => ({ value: r, label: r })),
-                  ]}
-                />
-              </Field>
-              <Field
-                label="Resolution"
-                hint={`Also sets how large a copy is uploaded: up to ${AI_MAX_EDGE[aiSize] ?? AI_MAX_EDGE[""]} px on the long edge.`}
-              >
-                <Select
-                  value={aiSize}
-                  onChange={setAiSize}
-                  options={[
-                    { value: "", label: "Model default" },
-                    ...["1K", "2K", "4K"].map((s) => ({ value: s, label: s })),
-                  ]}
-                />
-              </Field>
+              {provider === "openai" ? (
+                <>
+                  <Field label="Output size" hint="OpenAI works at one of three fixed sizes. Match input picks the nearest.">
+                    <Select value={aiAspect} onChange={setAiAspect} options={OPENAI_ASPECTS} />
+                  </Field>
+                  <Field label="Quality" hint="Higher is slower and costs more per image.">
+                    <Select value={aiSize} onChange={setAiSize} options={OPENAI_QUALITIES} />
+                  </Field>
+                </>
+              ) : (
+                <>
+                  <Field label="Aspect ratio">
+                    <Select
+                      value={aiAspect}
+                      onChange={setAiAspect}
+                      options={[
+                        { value: "", label: "Match input" },
+                        ...GOOGLE_ASPECTS.map((r) => ({ value: r, label: r })),
+                      ]}
+                    />
+                  </Field>
+                  <Field
+                    label="Resolution"
+                    hint={`Also sets how large a copy is uploaded: up to ${AI_MAX_EDGE[aiSize] ?? AI_MAX_EDGE[""]} px on the long edge.`}
+                  >
+                    <Select
+                      value={aiSize}
+                      onChange={setAiSize}
+                      options={[
+                        { value: "", label: "Model default" },
+                        ...GOOGLE_SIZES.map((s) => ({ value: s, label: s })),
+                      ]}
+                    />
+                  </Field>
+                </>
+              )}
               <p style={hint}>Type the edit in the bar over the photo, then Ctrl+Enter.</p>
               {emptyArea && (
                 <p style={{ ...hint, color: "var(--text)" }}>

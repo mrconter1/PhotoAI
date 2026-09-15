@@ -16,7 +16,8 @@ generative edits and compare before/after.
 - **Crop in or out** — rule-of-thirds crop with corner handles, ratio presets,
   and +10/25/50% buttons that grow the canvas past the photo. The added area is
   empty, and is what the AI fills.
-- **AI Edit** — describe a change; the photo is sent to Google's image model and returned as a new layer
+- **AI Edit** — describe a change; the photo is sent to an image model (Google
+  Gemini or OpenAI gpt-image, whichever you pick) and returned as a new layer
 - **Rerun / Restore** — after a run, Rerun sends the same prompt again (the
   model is not deterministic) and Restore puts it back in the box to change
 - **Versions** — ask for 1 to 4 results per run. One is applied straight away;
@@ -33,8 +34,11 @@ generative edits and compare before/after.
 ## Architecture
 
 - **Next.js (App Router) + React 19**. All editing runs client-side for speed;
-  the only server code is `app/api/ai-edit/route.ts`, which keeps the Google API
-  key server-side and proxies the request.
+  the only server code is `app/api/ai-edit/route.ts`, which keeps the API keys
+  server-side and proxies the request to Google (`generateContent`) or OpenAI
+  (`images/edits`) depending on the model. `app/api/models/route.ts` lists the
+  image models every configured key can reach; `lib/providers.ts` holds what
+  both sides need to know about the two providers.
 - `Workspace` owns the tabs, the file picker, the drop zone and the shared AI
   settings; each tab is an `Editor` that stays mounted while hidden, so
   switching costs nothing and a tab's blobs are only freed when it closes.
@@ -73,18 +77,21 @@ explicitly rather than left to chance:
 
 ```bash
 npm install
-cp .env.local.example .env.local   # add your GOOGLE_API_KEY
+cp .env.local.example .env.local   # add GOOGLE_API_KEY and/or OPENAI_API_KEY
 npm run dev
 ```
 
-Get an API key at https://aistudio.google.com/apikey.
-The default model is `gemini-3.1-flash-image` (override with `GOOGLE_IMAGE_MODEL`,
-or pick any available model in the app's AI Settings tab).
+Google keys come from https://aistudio.google.com/apikey, OpenAI keys from
+https://platform.openai.com/api-keys. One is enough; with both set the picker
+shows both providers' models. The default is `gemini-3.1-flash-image`
+(override with `GOOGLE_IMAGE_MODEL`); the model, aspect/size, quality and
+version count you pick are remembered in the browser.
 
 ## Deploy
 
-Deployed on Vercel. `GOOGLE_API_KEY` (and optionally `GOOGLE_IMAGE_MODEL`) must
-be set as project environment variables — never in the client bundle.
+Deployed on Vercel. `GOOGLE_API_KEY` and/or `OPENAI_API_KEY` (and optionally
+`GOOGLE_IMAGE_MODEL`) must be set as project environment variables — never in
+the client bundle.
 
 ```bash
 vercel link
@@ -96,5 +103,8 @@ vercel --prod
 
 ## Notes
 
-- Adjust/crop/transform work fully offline. Only **AI Edit** needs the API key.
+- Adjust/crop/transform work fully offline. Only **AI Edit** needs an API key.
+- OpenAI edits are sent at one of the three fixed sizes every gpt-image model
+  accepts (square, 1536×1024, 1024×1536), with `input_fidelity=high` where the
+  model takes it; the Google path sends the aspect ratio and resolution tier.
 - Everything stays in the browser except the AI request.
