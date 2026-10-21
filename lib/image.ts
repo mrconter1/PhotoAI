@@ -478,10 +478,81 @@ export async function saveImageAs(url: string, filename: string, mime: string): 
   return { method: "download", name: filename };
 }
 
-/** "IMG_1234.jpg" -> "IMG_1234-edited.png" */
-export function exportName(source: string | null, ext: string): string {
+type FileHandle = {
+  createWritable: () => Promise<{ write: (data: Blob) => Promise<void>; close: () => Promise<void> }>;
+};
+type DirectoryHandle = {
+  name: string;
+  getFileHandle: (name: string, opts?: { create?: boolean }) => Promise<FileHandle>;
+};
+type DirectoryPicker = (opts?: { id?: string; mode?: "read" | "readwrite" }) => Promise<DirectoryHandle>;
+
+export type SaveAllResult = { method: "folder" | "download"; folder: string | null; names: string[] } | null; // null = cancelled
+
+/**
+ * A name in the folder that is not taken yet: "x.png", then "x (2).png" and so
+ * on. Writing into a folder the person picked must never quietly overwrite a
+ * photo that was already there, such as the variants of an earlier run.
+ */
+async function freeName(dir: DirectoryHandle, name: string): Promise<string> {
+  const dot = name.lastIndexOf(".");
+  const base = dot > 0 ? name.slice(0, dot) : name;
+  const ext = dot > 0 ? name.slice(dot) : "";
+  for (let n = 1; n < 1000; n++) {
+    const candidate = n === 1 ? name : `${base} (${n})${ext}`;
+    try {
+      await dir.getFileHandle(candidate);
+    } catch (e) {
+      if (e instanceof DOMException && e.name === "NotFoundError") return candidate;
+      throw e;
+    }
+  }
+  throw new Error(`Could not find a free file name for ${name}.`);
+}
+
+/**
+ * Write several images into one folder. Where the browser can show a folder
+ * picker (Chrome/Edge desktop) the person chooses the folder once and every
+ * file lands there; elsewhere each one is downloaded, which the browser may
+ * ask to allow once for the site.
+ */
+export async function saveImagesToFolder(items: { url: string; name: string }[]): Promise<SaveAllResult> {
+  const picker = (window as unknown as { showDirectoryPicker?: DirectoryPicker }).showDirectoryPicker;
+  if (picker) {
+    let dir: DirectoryHandle | null = null;
+    try {
+      // First thing in the click, for the same transient-activation reason as
+      // the Save As dialog. The id makes the browser reopen the last folder.
+      dir = await picker({ id: "photoai-variants", mode: "readwrite" });
+    } catch (e) {
+      if (e instanceof DOMException && e.name === "AbortError") return null; // user closed the dialog
+      dir = null; // picker refused in this context - fall back to downloads
+    }
+    if (dir) {
+      const names: string[] = [];
+      for (const item of items) {
+        const name = await freeName(dir, item.name);
+        const blob = await (await fetch(item.url)).blob();
+        const writable = await (await dir.getFileHandle(name, { create: true })).createWritable();
+        await writable.write(blob);
+        await writable.close();
+        names.push(name);
+      }
+      return { method: "folder", folder: dir.name, names };
+    }
+  }
+  for (const [i, item] of items.entries()) {
+    // Spaced out: browsers drop rapid back-to-back downloads after the first.
+    if (i) await new Promise((r) => setTimeout(r, 250));
+    download(item.url, item.name);
+  }
+  return { method: "download", folder: null, names: items.map((i) => i.name) };
+}
+
+/** "IMG_1234.jpg" -> "IMG_1234-edited.png" (or "-variant-2.png" with that suffix) */
+export function exportName(source: string | null, ext: string, suffix = "edited"): string {
   const base = (source || "photo").replace(/\.[^.]+$/, "").trim() || "photo";
-  return `${base}-edited.${ext}`;
+  return `${base}-${suffix}.${ext}`;
 }
 
 export function formatBytes(n: number): string {

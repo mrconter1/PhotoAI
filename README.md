@@ -26,7 +26,9 @@ generative edits and compare before/after.
   model is not deterministic) and Restore puts it back in the box to change
 - **Versions** — ask for 1 to 4 results per run. One is applied straight away;
   several are held out of the history until you pick, with a thumbnail strip of
-  the original plus each result (← / → to step, Enter to keep, Esc to discard)
+  the original plus each result (← / → to step, Enter to keep, Esc to discard).
+  **Save all** writes every version into a folder you pick (`<name>-variant-1.png`
+  and so on, never overwriting a file already there) and leaves the choice open
 - **Fill empty space** — one-click outpaint of the area a crop-out added. The
   empty band is painted flat grey for the upload and described to the model by
   side and width, and the request asks for the padded canvas's own aspect ratio.

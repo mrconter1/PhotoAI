@@ -24,6 +24,7 @@ import {
   openImageFile,
   revoke,
   saveImageAs,
+  saveImagesToFolder,
   scaleCrop,
 } from "@/lib/image";
 import CropOverlay from "./CropOverlay";
@@ -207,7 +208,11 @@ export default function Editor({ active, file, onOpen, onStatus, models, ai, set
   // Whether this browser can offer a real Save As dialog. Read once on the
   // client: touching window during render would differ from the server pass.
   const [canPick, setCanPick] = useState(false);
-  useEffect(() => setCanPick(canPickSaveLocation()), []);
+  const [canPickFolder, setCanPickFolder] = useState(false);
+  useEffect(() => {
+    setCanPick(canPickSaveLocation());
+    setCanPickFolder(typeof (window as { showDirectoryPicker?: unknown }).showDirectoryPicker === "function");
+  }, []);
 
   // AI settings live in the workspace, shared by every tab. Read here under
   // the names the rest of the editor grew up with.
@@ -687,6 +692,36 @@ export default function Editor({ active, file, onOpen, onStatus, models, ai, set
     setCandidates(null);
     setPick(0);
   }, [candidates]);
+
+  /**
+   * Write every version that came back into one folder, without deciding
+   * anything: the chooser stays open, so one can still be picked to keep
+   * editing. The photo's own saved state is untouched - these are extra files.
+   */
+  const [savingAll, setSavingAll] = useState(false);
+  const saveAllVariants = useCallback(async () => {
+    if (!candidates) return;
+    const items = candidates.map((c, i) => ({
+      url: c.url,
+      name: exportName(sourceName, EXT[c.mime] || "png", `variant-${i + 1}`),
+    }));
+    setSavingAll(true);
+    try {
+      const result = await saveImagesToFolder(items);
+      if (!result) return; // the folder dialog was closed; nothing was written
+      const n = result.names.length;
+      setNotice(
+        result.method === "folder"
+          ? `Saved ${n} versions in "${result.folder}": ${result.names.join(", ")}.`
+          : `Downloaded ${n} versions to this browser's Downloads folder (Ctrl+J opens it). ` +
+              `If only one arrived, allow multiple downloads for this site and save again.`
+      );
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Could not save the versions.");
+    } finally {
+      setSavingAll(false);
+    }
+  }, [candidates, sourceName]);
 
   const doDownload = useCallback(async (): Promise<boolean> => {
     if (choosing) return false; // saving a version you have not accepted yet
@@ -1191,7 +1226,7 @@ export default function Editor({ active, file, onOpen, onStatus, models, ai, set
                 <textarea
                   ref={aiInputRef}
                   rows={1}
-                  placeholder="Describe an edit — e.g. remove the background… Paste images to use as references. (Ctrl+Enter to run)"
+                  placeholder="Describe an edit, or paste images to use as references… (Ctrl+Enter to run)"
                   value={aiPrompt}
                   onChange={(e) => setAiPrompt(e.target.value)}
                   onKeyDown={(e) => {
@@ -1353,9 +1388,19 @@ export default function Editor({ active, file, onOpen, onStatus, models, ai, set
                     ? "Showing the photo you started from"
                     : `Showing version ${pick} of ${candidates.length}`}
                 </span>
-                <button onClick={discardPicks} style={{ marginLeft: "auto" }}>
-                  Discard all
+                <button
+                  onClick={() => void saveAllVariants()}
+                  disabled={savingAll}
+                  style={{ marginLeft: "auto" }}
+                  title={
+                    canPickFolder
+                      ? "Save every version into a folder you pick - you can still choose one afterwards"
+                      : "Download every version - you can still choose one afterwards"
+                  }
+                >
+                  {savingAll ? "Saving…" : `Save all ${candidates.length}`}
                 </button>
+                <button onClick={discardPicks}>Discard all</button>
                 <button className="primary" onClick={commitPick}>
                   {pick === 0 ? "Keep the original" : `Use version ${pick}`}
                 </button>
