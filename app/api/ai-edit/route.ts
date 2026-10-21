@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { GoogleGenAI } from "@google/genai";
-import { GOOGLE_SIZES, Provider, openaiQuality, openaiSize, providerOf } from "@/lib/providers";
+import { GOOGLE_SIZES, MAX_REFERENCES, Provider, openaiQuality, openaiSize, providerOf } from "@/lib/providers";
 
 // Node runtime: keeps the API keys server-side and handles larger payloads.
 export const runtime = "nodejs";
@@ -15,6 +15,15 @@ const DEFAULT_MODEL = process.env.GOOGLE_IMAGE_MODEL || "gemini-3.1-flash-image"
 const MAX_UPLOAD_BYTES = 4 * 1024 * 1024;
 
 const ACCEPTED = ["image/png", "image/jpeg", "image/webp", "image/heic", "image/heif"];
+
+const EXT: Record<string, string> = { "image/jpeg": "jpg", "image/webp": "webp" };
+
+/** An uploaded image with the type the model should be told it is. */
+type Upload = { file: Blob; mimeType: string };
+
+function upload(file: Blob): Upload {
+  return { file, mimeType: ACCEPTED.includes(file.type) ? file.type : "image/png" };
+}
 
 function fail(error: string, status: number) {
   return NextResponse.json({ error }, { status });
@@ -33,16 +42,39 @@ function imageResponse(bytes: Buffer, mime: string) {
 }
 
 type Edit = {
-  file: Blob;
-  mimeType: string;
+  image: Upload;
+  /** Extra images the prompt can point at: a face, a product, a style. */
+  references: Upload[];
   prompt: string;
   model: string;
   aspectRatio: string; // "w:h" or "" for match input
   imageSize: string; // Google: 1K/2K/4K; OpenAI: low/medium/high; "" = default
 };
 
+/**
+ * The prompt as the model sees it. With references attached it has to be told
+ * which image is the one being edited - both APIs take a flat list, and left
+ * to guess, a model will as happily redraw the reference as the photo.
+ */
+function framePrompt(e: Edit): string {
+  const n = e.references.length;
+  if (!n) return e.prompt;
+  const which = n === 1 ? "The second image is a reference" : `The other ${n} images are references`;
+  return (
+    `The first image is the photo to edit; return that photo with the change applied, keeping its framing. ` +
+    `${which} supplied by the user - use ${n === 1 ? "it" : "them"} only as the instruction asks, and do not return ${n === 1 ? "it" : "them"} as the result.
+
+` +
+    e.prompt
+  );
+}
+
+const inline = async (u: Upload) => ({
+  inlineData: { mimeType: u.mimeType, data: Buffer.from(await u.file.arrayBuffer()).toString("base64") },
+});
+
 async function editWithGoogle(apiKey: string, e: Edit) {
-  const data = Buffer.from(await e.file.arrayBuffer()).toString("base64");
+  const images = await Promise.all([e.image, ...e.references].map(inline));
 
   // Optional image config (aspect ratio / resolution) - only sent when set.
   // A size tier that is not Google's (an OpenAI quality left over from a
@@ -58,7 +90,7 @@ async function editWithGoogle(apiKey: string, e: Edit) {
     contents: [
       {
         role: "user",
-        parts: [{ inlineData: { mimeType: e.mimeType, data } }, { text: e.prompt }],
+        parts: [...images, { text: framePrompt(e) }],
       },
     ],
     ...(config ? { config } : {}),
@@ -90,15 +122,18 @@ async function editWithGoogle(apiKey: string, e: Edit) {
  * and dropped on that one refusal.
  */
 async function editWithOpenAI(apiKey: string, e: Edit) {
-  const ext = e.mimeType === "image/jpeg" ? "jpg" : e.mimeType === "image/webp" ? "webp" : "png";
   const size = openaiSize(e.aspectRatio);
   const quality = openaiQuality(e.imageSize);
 
   const send = async (fidelity: boolean) => {
     const form = new FormData();
     form.append("model", e.model);
-    form.append("image[]", new File([e.file], `image.${ext}`, { type: e.mimeType }));
-    form.append("prompt", e.prompt);
+    // The photo goes first: images/edits edits the first image and reads the
+    // rest as input, which is the order framePrompt describes.
+    [e.image, ...e.references].forEach((u, i) =>
+      form.append("image[]", new File([u.file], `${i ? `reference-${i}` : "image"}.${EXT[u.mimeType] ?? "png"}`, { type: u.mimeType }))
+    );
+    form.append("prompt", framePrompt(e));
     form.append("size", size);
     form.append("quality", quality);
     form.append("output_format", "png");
@@ -143,6 +178,7 @@ export async function POST(req: NextRequest) {
   }
 
   const file = form.get("image");
+  const references = form.getAll("reference").filter((r): r is File => r instanceof Blob && r.size > 0);
   const prompt = String(form.get("prompt") ?? "").trim();
   const model = String(form.get("model") ?? "") || DEFAULT_MODEL;
   const provider = (String(form.get("provider") ?? "") as Provider) || providerOf(model);
@@ -152,15 +188,25 @@ export async function POST(req: NextRequest) {
   if (!(file instanceof Blob)) return fail("No image was uploaded.", 400);
   if (!prompt) return fail("Describe the edit you want.", 400);
   if (file.size === 0) return fail("The uploaded image was empty.", 400);
-  if (file.size > MAX_UPLOAD_BYTES) {
+  if (references.length > MAX_REFERENCES) {
+    return fail(`At most ${MAX_REFERENCES} reference images can go with one edit.`, 400);
+  }
+  const total = references.reduce((sum, r) => sum + r.size, file.size);
+  if (total > MAX_UPLOAD_BYTES) {
     return fail(
-      `That image is ${(file.size / 1024 / 1024).toFixed(1)} MB, over the ${MAX_UPLOAD_BYTES / 1024 / 1024} MB limit for an AI edit.`,
+      `The upload is ${(total / 1024 / 1024).toFixed(1)} MB, over the ${MAX_UPLOAD_BYTES / 1024 / 1024} MB limit for an AI edit.`,
       413
     );
   }
 
-  const mimeType = ACCEPTED.includes(file.type) ? file.type : "image/png";
-  const edit: Edit = { file, mimeType, prompt, model, aspectRatio, imageSize };
+  const edit: Edit = {
+    image: upload(file),
+    references: references.map(upload),
+    prompt,
+    model,
+    aspectRatio,
+    imageSize,
+  };
 
   const keyName = provider === "openai" ? "OPENAI_API_KEY" : "GOOGLE_API_KEY";
   const apiKey = process.env[keyName];

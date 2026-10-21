@@ -390,6 +390,33 @@ export async function encodeForUpload(
   return { blob, width: canvas.width, height: canvas.height };
 }
 
+// Reference images ride along in the same request as the photo, so they share
+// its 3.5 MB. They are there to show the model a face, a product or a style,
+// which reads fine at 1024 px, and each is held small enough that the photo
+// itself keeps most of the budget.
+export const REFERENCE_MAX_EDGE = 1024;
+export const REFERENCE_MAX_BYTES = 450 * 1024;
+
+/**
+ * Encode a pasted, dropped or picked file as a reference image, once, when it
+ * is added - not on every Generate. Throws a readable error for anything the
+ * browser cannot decode (HEIC outside Safari, a PDF, a broken file).
+ */
+export async function encodeReference(file: Blob): Promise<{ blob: Blob; width: number; height: number }> {
+  const url = URL.createObjectURL(file);
+  try {
+    let img: HTMLImageElement;
+    try {
+      img = await loadImage(url);
+    } catch {
+      throw new Error("That reference image could not be read. Try a JPEG, PNG or WebP.");
+    }
+    return await encodeForUpload(img, REFERENCE_MAX_EDGE, REFERENCE_MAX_BYTES);
+  } finally {
+    revoke(url);
+  }
+}
+
 export function download(url: string, filename: string) {
   const a = document.createElement("a");
   a.href = url;

@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useImperativeHandle, useMemo, useRef, useState } from "react";
 import {
   AI_MAX_EDGE,
+  AI_MAX_UPLOAD_BYTES,
   Adjustments,
   CropRect,
   EMPTY_FILL,
@@ -14,6 +15,7 @@ import {
   clampCrop,
   emptyMargins,
   encodeForUpload,
+  encodeReference,
   exportName,
   fitCropRatio,
   formatBytes,
@@ -28,6 +30,7 @@ import CropOverlay from "./CropOverlay";
 import {
   GOOGLE_ASPECTS,
   GOOGLE_SIZES,
+  MAX_REFERENCES,
   ModelInfo,
   OPENAI_ASPECTS,
   OPENAI_QUALITIES,
@@ -144,6 +147,8 @@ type EditorProps = {
   models: ModelInfo[];
   ai: AiSettings;
   setAi: (patch: Partial<AiSettings>) => void;
+  /** Files are being dragged over the window, so the AI bar offers itself as a drop target. */
+  dragging: boolean;
   ref?: React.Ref<EditorHandle>;
 };
 
@@ -152,7 +157,7 @@ type EditorProps = {
  * tab and keeps them all mounted, so switching tabs costs nothing and every
  * tab keeps its history, zoom and open panel.
  */
-export default function Editor({ active, file, onOpen, onStatus, models, ai, setAi, ref }: EditorProps) {
+export default function Editor({ active, file, onOpen, onStatus, models, ai, setAi, dragging, ref }: EditorProps) {
   // history of baked PNG object URLs (blob:); index = current state
   const [history, setHistory] = useState<string[]>([]);
   const [index, setIndex] = useState(-1);
@@ -225,6 +230,16 @@ export default function Editor({ active, file, onOpen, onStatus, models, ai, set
   const candidateLabel = useRef("");
   const choosing = candidates !== null;
   const aiInputRef = useRef<HTMLTextAreaElement>(null);
+
+  // Images sent beside the photo for the model to draw from: "put this logo on
+  // the shirt", "make her look like this". Encoded small once, when added, and
+  // kept across runs - Rerun with the same prompt wants the same references.
+  const [refs, setRefs] = useState<{ id: number; url: string; blob: Blob; name: string }[]>([]);
+  const refsRef = useRef(refs);
+  refsRef.current = refs;
+  const nextRefId = useRef(1);
+  const refInputRef = useRef<HTMLInputElement>(null);
+  const [refDrop, setRefDrop] = useState(false); // a drag is over the AI bar itself
 
   // auto-focus the prompt when the AI tool is chosen
   useEffect(() => {
@@ -426,9 +441,46 @@ export default function Editor({ active, file, onOpen, onStatus, models, ai, set
     () => () => {
       for (const u of historyRef.current) revoke(u);
       for (const c of candidatesRef.current ?? []) revoke(c.url);
+      for (const r of refsRef.current) revoke(r.url);
     },
     []
   );
+
+  const addReferences = useCallback(async (files: File[]) => {
+    const images = files.filter((f) => !f.type || f.type.startsWith("image/"));
+    if (!images.length) return;
+    const room = MAX_REFERENCES - refsRef.current.length;
+    if (room <= 0) {
+      setNotice(`An edit can carry ${MAX_REFERENCES} reference images. Remove one to add another.`);
+      return;
+    }
+    if (images.length > room) {
+      setNotice(`Only ${MAX_REFERENCES} reference images fit - added the first ${room}.`);
+    }
+    setError(null);
+    for (const f of images.slice(0, room)) {
+      try {
+        const { blob } = await encodeReference(f);
+        const ref = { id: nextRefId.current++, url: URL.createObjectURL(blob), blob, name: f.name || "Pasted image" };
+        // Re-checked per file: a second paste can land while the first encodes.
+        if (refsRef.current.length >= MAX_REFERENCES) {
+          revoke(ref.url);
+          break;
+        }
+        refsRef.current = [...refsRef.current, ref];
+        setRefs(refsRef.current);
+      } catch (e) {
+        setError(e instanceof Error ? e.message : "Could not add that reference image.");
+      }
+    }
+  }, []);
+
+  const removeReference = useCallback((id: number) => {
+    const gone = refsRef.current.find((r) => r.id === id);
+    if (gone) revoke(gone.url);
+    refsRef.current = refsRef.current.filter((r) => r.id !== id);
+    setRefs(refsRef.current);
+  }, []);
 
   const flatten = useCallback(async (): Promise<HTMLImageElement> => {
     if (!img) throw new Error("No image.");
@@ -544,13 +596,21 @@ export default function Editor({ active, file, onOpen, onStatus, models, ai, set
         // Empty space is painted flat grey on the way out. Alpha survives the
         // WebP encode but not the trip through the model, and a region the model
         // cannot see is a region it will not fill.
+        // References share the request with the photo, so the photo gets
+        // what they leave of the budget (never less than half of it).
+        const sending = refsRef.current;
+        const refBytes = sending.reduce((sum, r) => sum + r.blob.size, 0);
         const { blob, width, height } = await encodeForUpload(
           flat,
           AI_MAX_EDGE[aiSize] ?? AI_MAX_EDGE[""],
-          undefined,
+          Math.max(AI_MAX_UPLOAD_BYTES / 2, AI_MAX_UPLOAD_BYTES - refBytes),
           margins ? EMPTY_FILL : undefined
         );
-        setLastUpload(`${width} × ${height} px · ${formatBytes(blob.size)}`);
+        setLastUpload(
+          `${width} × ${height} px` +
+            (sending.length ? ` + ${sending.length} reference${sending.length > 1 ? "s" : ""}` : "") +
+            ` · ${formatBytes(blob.size + refBytes)}`
+        );
 
         const prompt = mode === "fill" ? fillPrompt(margins, extra) : extra;
         // An outpaint must come back the same shape it went out as, or the model
@@ -564,6 +624,7 @@ export default function Editor({ active, file, onOpen, onStatus, models, ai, set
         const send = async () => {
           const form = new FormData();
           form.append("image", blob, "image.webp");
+          sending.forEach((r, i) => form.append("reference", r.blob, `reference-${i + 1}.webp`));
           form.append("prompt", prompt);
           if (aiModel) form.append("model", aiModel);
           form.append("provider", provider);
@@ -584,7 +645,8 @@ export default function Editor({ active, file, onOpen, onStatus, models, ai, set
           throw first?.reason instanceof Error ? first.reason : new Error("AI request failed.");
         }
 
-        const label = mode === "fill" ? "AI: fill empty space" : `AI: ${extra}`;
+        const withRefs = sending.length ? ` (+${sending.length} reference${sending.length > 1 ? "s" : ""})` : "";
+        const label = (mode === "fill" ? "AI: fill empty space" : `AI: ${extra}`) + withRefs;
         setAiPrompt(""); // clear on success; stay on the AI tool for the next edit (Restore brings it back)
         if (got.length < runs) {
           setNotice(`${got.length} of ${runs} versions came back. Showing what arrived.`);
@@ -865,6 +927,24 @@ export default function Editor({ active, file, onOpen, onStatus, models, ai, set
     return () => window.removeEventListener("keydown", down);
   }, [toggleLast, stepBack, stepForward]);
 
+  // Pasting an image while the AI bar is up adds it as a reference. Text still
+  // pastes into the prompt as usual; only a clipboard holding image files is
+  // taken, so copying a photo from the browser or Explorer and pressing Ctrl+V
+  // is all it takes.
+  const pasteTarget = useRef(false);
+  pasteTarget.current = active && panel === "ai" && !choosing && !!current;
+  useEffect(() => {
+    const onPaste = (e: ClipboardEvent) => {
+      if (!pasteTarget.current) return;
+      const files = Array.from(e.clipboardData?.files ?? []).filter((f) => f.type.startsWith("image/"));
+      if (!files.length) return;
+      e.preventDefault();
+      void addReferences(files);
+    };
+    window.addEventListener("paste", onPaste);
+    return () => window.removeEventListener("paste", onPaste);
+  }, [addReferences]);
+
   // Panning is always available. In crop mode, drags that start on the crop
   // box/handles are captured by the overlay; drags anywhere else pan the view.
   const pan = useRef<{ x: number; y: number; vx: number; vy: number } | null>(null);
@@ -1017,12 +1097,39 @@ export default function Editor({ active, file, onOpen, onStatus, models, ai, set
           {/* floating AI prompt bar, below the image */}
           {panel === "ai" && !choosing && (
             <div
-              style={aiBar}
+              style={{
+                ...aiBar,
+                // Lifted over the workspace's drop overlay while files are in
+                // the air, so there is somewhere visible to drop a reference.
+                ...(dragging && active ? aiBarDropTarget : null),
+                ...(refDrop ? { borderColor: "var(--accent)", background: "rgba(30,42,66,0.96)" } : null),
+              }}
               // The stage captures the pointer on any pointerdown that reaches
               // it, to pan. Capture retargets the click, so a button inside this
               // bar would never fire one. CropOverlay guards itself the same way.
               onPointerDown={(e) => e.stopPropagation()}
+              onDragOver={(e) => {
+                if (!Array.from(e.dataTransfer.types || []).includes("Files")) return;
+                e.preventDefault();
+                e.dataTransfer.dropEffect = "copy";
+                setRefDrop(true);
+              }}
+              onDragLeave={(e) => {
+                if (!e.currentTarget.contains(e.relatedTarget as Node | null)) setRefDrop(false);
+              }}
+              onDrop={(e) => {
+                // Marked handled so the workspace resets its overlay but does
+                // not also open the file as a new tab.
+                e.preventDefault();
+                setRefDrop(false);
+                void addReferences(Array.from(e.dataTransfer.files ?? []));
+              }}
             >
+              {dragging && active && (
+                <div style={{ ...hint, fontSize: 12, color: "var(--text)", marginBottom: 8, fontWeight: 600 }}>
+                  Drop here to add as a reference image - anywhere else opens it in a new tab
+                </div>
+              )}
               {aiBusy && (
                 <div style={aiBusyOverlay}>
                   <span className="spinner" />
@@ -1031,11 +1138,60 @@ export default function Editor({ active, file, onOpen, onStatus, models, ai, set
                   </span>
                 </div>
               )}
+              {refs.length > 0 && (
+                <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 8, flexWrap: "wrap" }}>
+                  {refs.map((r, i) => (
+                    <div key={r.id} style={refChip} title={r.name}>
+                      <img src={r.url} alt={r.name} style={refThumb} draggable={false} />
+                      <span style={{ ...ellipsis, maxWidth: 110, fontSize: 11 }}>
+                        {i + 2}. {r.name}
+                      </span>
+                      <button
+                        onClick={() => removeReference(r.id)}
+                        disabled={aiBusy}
+                        style={{ ...iconBtn, width: 18, height: 18, fontSize: 14 }}
+                        title="Remove this reference"
+                        aria-label={`Remove ${r.name}`}
+                      >
+                        ×
+                      </button>
+                    </div>
+                  ))}
+                  <span style={{ ...hint, fontSize: 11 }}>
+                    sent with the photo; say in the prompt what to take from {refs.length > 1 ? "them" : "it"}
+                  </span>
+                </div>
+              )}
               <div style={{ display: "flex", gap: 8, alignItems: "flex-end" }}>
+                <button
+                  onClick={() => refInputRef.current?.click()}
+                  disabled={aiBusy || refs.length >= MAX_REFERENCES}
+                  style={{ height: 40, width: 40, padding: 0, fontSize: 18, flexShrink: 0 }}
+                  title={
+                    refs.length >= MAX_REFERENCES
+                      ? `${MAX_REFERENCES} reference images is the limit`
+                      : "Add reference images (or paste one with Ctrl+V, or drop it on this bar)"
+                  }
+                  aria-label="Add reference image"
+                >
+                  +
+                </button>
+                <input
+                  ref={refInputRef}
+                  type="file"
+                  accept="image/*"
+                  multiple
+                  style={{ display: "none" }}
+                  onChange={(e) => {
+                    const files = Array.from(e.target.files ?? []);
+                    e.target.value = ""; // allow re-picking the same file
+                    void addReferences(files);
+                  }}
+                />
                 <textarea
                   ref={aiInputRef}
                   rows={1}
-                  placeholder="Describe an edit — e.g. remove the background… (Ctrl+Enter to run)"
+                  placeholder="Describe an edit — e.g. remove the background… Paste images to use as references. (Ctrl+Enter to run)"
                   value={aiPrompt}
                   onChange={(e) => setAiPrompt(e.target.value)}
                   onKeyDown={(e) => {
@@ -2317,6 +2473,28 @@ const aiBar: React.CSSProperties = {
   borderRadius: 12,
   padding: 12,
   boxShadow: "0 12px 40px rgba(0,0,0,0.55)",
+};
+const aiBarDropTarget: React.CSSProperties = {
+  zIndex: 151, // just over the workspace's drop overlay (150)
+  border: "2px dashed var(--accent)",
+};
+const refChip: React.CSSProperties = {
+  display: "flex",
+  alignItems: "center",
+  gap: 6,
+  padding: "3px 4px 3px 3px",
+  borderRadius: 8,
+  border: "1px solid var(--border)",
+  background: "var(--panel-2)",
+  minWidth: 0,
+};
+const refThumb: React.CSSProperties = {
+  width: 28,
+  height: 28,
+  objectFit: "cover",
+  borderRadius: 5,
+  display: "block",
+  flexShrink: 0,
 };
 const cropReadout: React.CSSProperties = {
   display: "flex",

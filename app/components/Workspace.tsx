@@ -196,10 +196,12 @@ export default function Workspace() {
     if (!dragDepth.current) setDragging(false);
   };
   const onDrop = (e: React.DragEvent) => {
+    // A drop the AI bar already took as a reference image is not a photo to open.
+    const claimed = e.defaultPrevented;
     e.preventDefault();
     dragDepth.current = 0;
     setDragging(false);
-    openFiles(Array.from(e.dataTransfer.files ?? []));
+    if (!claimed) openFiles(Array.from(e.dataTransfer.files ?? []));
   };
 
   const tabName = (t: Tab) => status[t.id]?.name ?? t.file?.name ?? "New tab";
@@ -273,6 +275,7 @@ export default function Workspace() {
           models={models}
           ai={ai}
           setAi={setAi}
+          dragging={dragging}
         />
       ))}
 
