@@ -18,6 +18,10 @@ generative edits and compare before/after.
   empty, and is what the AI fills.
 - **AI Edit** — describe a change; the photo is sent to an image model (Google
   Gemini or OpenAI gpt-image, whichever you pick) and returned as a new layer
+- **Reference images** - paste (Ctrl+V), drop on the AI bar, or pick with +
+  up to three extra images to send beside the photo ("put this logo on the
+  shirt"). They stay attached across runs until removed, and share the
+  photo's upload budget at 1024 px each.
 - **Rerun / Restore** — after a run, Rerun sends the same prompt again (the
   model is not deterministic) and Restore puts it back in the box to change
 - **Versions** — ask for 1 to 4 results per run. One is applied straight away;
