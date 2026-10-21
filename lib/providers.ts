@@ -11,6 +11,13 @@ export function providerOf(model: string): Provider {
   return /^(gpt-image|dall-e)/i.test(model) ? "openai" : "google";
 }
 
+/**
+ * Extra images one edit may carry beside the photo. Both providers take more
+ * (OpenAI up to 16, Gemini over a dozen), but they share the photo's upload
+ * budget, and past three the model mostly blends them rather than using each.
+ */
+export const MAX_REFERENCES = 3;
+
 // Google takes an aspect ratio and a resolution tier; OpenAI takes a pixel
 // size and a quality tier. The same two settings are kept for both and read
 // per provider, so switching models does not need a second set of fields.
